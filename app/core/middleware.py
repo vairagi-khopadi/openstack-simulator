@@ -22,6 +22,8 @@ from starlette.middleware.cors import CORSMiddleware
 from app import __version__
 from app.core.config import API_VERSIONS, now_utc, service_url, settings
 from app.core.database import SessionLocal
+from app.core.microversion import NegotiationError, negotiate
+from app.core.pagination import PaginationError
 from app.models.failure import FailureInjection
 from app.models.identity import Project, Token, User
 
@@ -531,21 +533,26 @@ def _fail_response(
 # --------------------------------------------------------------------------------------
 
 
-def version_headers(service: str) -> dict[str, str]:
-    """Echo the modern microversion for this service regardless of what was asked for."""
+def version_headers(service: str, served: str | None = None) -> dict[str, str]:
+    """Report the version this response was rendered at, plus the advertised range.
+
+    ``served`` is the negotiated version; it defaults to the maximum only for callers
+    outside a request, since a real service reports what it actually served.
+    """
     entry = API_VERSIONS.get(service)
     if entry is None:
         return {}
     name, minimum, maximum = entry
+    current = served or maximum
     headers = {
-        "OpenStack-API-Version": f"{name} {maximum}",
-        f"X-OpenStack-{name.capitalize()}-API-Version": maximum,
+        "OpenStack-API-Version": f"{name} {current}",
+        f"X-OpenStack-{name.capitalize()}-API-Version": current,
         f"X-OpenStack-{name.capitalize()}-API-Minimum-Version": minimum,
         f"X-OpenStack-{name.capitalize()}-API-Maximum-Version": maximum,
         "Vary": "OpenStack-API-Version",
     }
     if service == "nova":
-        headers["X-OpenStack-Nova-API-Version"] = maximum
+        headers["X-OpenStack-Nova-API-Version"] = current
         headers["X-OpenStack-Nova-API-Minimum-Version"] = minimum
         headers["X-OpenStack-Nova-API-Maximum-Version"] = maximum
     return headers
@@ -569,13 +576,26 @@ def create_service_app(service: str, title: str, description: str = "") -> FastA
         openapi_url="/openapi.json",
     )
     app.state.service = service
-    static_headers = version_headers(service)
 
     @app.middleware("http")
     async def _decorate(request: Request, call_next: Callable[..., Any]) -> Response:
         request.state.service = service
+        # Negotiate before the handler runs: the version decides what the handler
+        # renders, and an unserviceable one is refused instead of being served as
+        # something else.
+        try:
+            negotiated = negotiate(service, request.headers)
+        except NegotiationError as exc:
+            response = error_response(service, exc.status, exc.message)
+            for key, value in version_headers(service).items():
+                response.headers[key] = value
+            return response
+        request.state.microversion = negotiated
+
         response = await call_next(request)
-        for key, value in static_headers.items():
+        for key, value in version_headers(
+            service, str(negotiated) if negotiated else None
+        ).items():
             response.headers[key] = value
         response.headers.setdefault(
             "x-openstack-request-id", f"req-{random.getrandbits(64):016x}"
@@ -610,6 +630,12 @@ def create_service_app(service: str, title: str, description: str = "") -> FastA
             else error_payload(service, exc.status_code, str(detail))
         )
         return render_error(payload, exc.status_code, exc.headers)
+
+    @app.exception_handler(PaginationError)
+    async def _bad_marker(request: Request, exc: PaginationError) -> Response:
+        # Every service answers a marker it cannot find with a 400 rather than an empty
+        # page -- an empty page would look like the end of the collection.
+        return error_response(service, 400, exc.message)
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(

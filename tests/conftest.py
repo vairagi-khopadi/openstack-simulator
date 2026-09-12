@@ -30,7 +30,7 @@ import pytest  # noqa: E402
 from sqlalchemy import update  # noqa: E402
 
 import main  # noqa: E402
-from app.core.config import now_utc, settings  # noqa: E402
+from app.core.config import API_VERSIONS, now_utc, settings  # noqa: E402
 from app.core.database import Base, SessionLocal, get_engine  # noqa: E402
 from app.core.middleware import invalidate_scenario_cache  # noqa: E402
 from seed import (  # noqa: E402
@@ -158,9 +158,22 @@ async def token(raw_clients: dict[str, httpx.AsyncClient], cloud: Cloud) -> str:
 
 @pytest.fixture
 async def api(raw_clients: dict[str, httpx.AsyncClient], token: str) -> Any:
-    """Authenticated clients, keyed by service name."""
-    for client in raw_clients.values():
+    """Authenticated clients, keyed by service name, pinned to the newest microversion.
+
+    Pinning matters now that negotiation is real: a client that sends no version header
+    gets the service *minimum*, as it would from a real deployment, and the modern
+    response shape most tests assert on would simply not be there. ``openrc.sh`` pins the
+    same versions, so the suite and the shipped credentials agree.
+
+    Tests that want an older shape override the header on the one request, and
+    ``raw_clients`` stays unpinned for tests about the default.
+    """
+    for name, client in raw_clients.items():
         client.headers["X-Auth-Token"] = token
+        entry = API_VERSIONS.get(name)
+        if entry is not None:
+            service_type, _, maximum = entry
+            client.headers["OpenStack-API-Version"] = f"{service_type} {maximum}"
     return raw_clients
 
 

@@ -25,6 +25,8 @@ from app.core.config import (
     transition_deadline,
 )
 from app.core.database import get_session
+from app.core.microversion import at_least
+from app.core.pagination import collection_links, page_request, paginate
 from app.core.middleware import AuthContext, OSPayload, fault, require
 from app.models.compute import Flavor, Keypair, Server
 from app.models.network import Network, Port, SecurityGroup
@@ -198,7 +200,15 @@ def server_dict(
     networks: dict[str, str],
     attachments: list[VolumeAttachment],
     detail: bool = True,
+    request: Request | None = None,
 ) -> dict[str, Any]:
+    """The server body, rendered at the microversion this request negotiated.
+
+    Nova grew this response one field at a time, and a client pinned to an old version
+    must not see a field that did not exist then -- that is the whole point of asking for
+    a version. ``request`` carries the negotiated one; without it every field is rendered,
+    which is what internal callers with no request in hand want.
+    """
     if not detail:
         return {
             "id": server.id,
@@ -222,12 +232,6 @@ def server_dict(
         "key_name": server.key_name,
         "metadata": dict(server.metadata_ or {}),
         "config_drive": server.config_drive,
-        "description": None,
-        "locked": server.locked,
-        "tags": list(server.tags or []),
-        "trusted_image_certificates": None,
-        "server_groups": [],
-        "host_status": "UP",
         "links": _links("servers", server.id),
         "image": {"id": server.image_id, "links": _links("images", server.image_id)}
         if server.image_id
@@ -250,17 +254,33 @@ def server_dict(
             for a in attachments
         ],
     }
+    # Each of these arrived in a specific microversion, and is absent before it.
+    for since, key, value in (
+        ("2.9", "locked", server.locked),
+        ("2.16", "host_status", "UP"),
+        ("2.19", "description", None),
+        ("2.26", "tags", list(server.tags or [])),
+        ("2.63", "trusted_image_certificates", None),
+        ("2.71", "server_groups", []),
+    ):
+        if request is None or at_least(request, since):
+            body[key] = value
+
     if flavor is not None:
-        # Microversion >= 2.47 embeds the flavor instead of linking to it.
-        body["flavor"] = {
-            "vcpus": server.allocated_vcpus or flavor.vcpus,
-            "ram": server.allocated_ram_mb or flavor.ram,
-            "disk": server.allocated_disk_gb or flavor.disk,
-            "ephemeral": flavor.ephemeral,
-            "swap": flavor.swap or 0,
-            "original_name": flavor.name,
-            "extra_specs": dict(flavor.extra_specs or {}),
-        }
+        if request is None or at_least(request, "2.47"):
+            # 2.47 embeds the flavor; before it the server only linked to one, which is
+            # why a deleted flavor used to make old servers unreadable.
+            body["flavor"] = {
+                "vcpus": server.allocated_vcpus or flavor.vcpus,
+                "ram": server.allocated_ram_mb or flavor.ram,
+                "disk": server.allocated_disk_gb or flavor.disk,
+                "ephemeral": flavor.ephemeral,
+                "swap": flavor.swap or 0,
+                "original_name": flavor.name,
+                "extra_specs": dict(flavor.extra_specs or {}),
+            }
+        else:
+            body["flavor"] = {"id": flavor.id, "links": _links("flavors", flavor.id)}
     if server.fault:
         body["fault"] = server.fault
     return body
@@ -377,24 +397,41 @@ async def extensions(auth: AuthContext = auth_dep) -> dict[str, Any]:
 
 @router.get("/v2.1/flavors")
 async def list_flavors(
-    auth: AuthContext = auth_dep, session: AsyncSession = Depends(get_session)
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    flavors = (await session.execute(select(Flavor).order_by(Flavor.ram))).scalars().all()
+    page = page_request(request.query_params, SERVICE)
+    # Flavors page smallest-first, the order the collection is already sorted in.
+    stmt = await paginate(
+        session, select(Flavor), Flavor, page, sort_column=Flavor.ram, descending=False
+    )
+    flavors = list((await session.execute(stmt)).scalars().all())
     return {
         "flavors": [
             {"id": f.id, "name": f.name, "description": f.description,
              "links": _links("flavors", f.id)}
             for f in flavors
-        ]
+        ],
+        **collection_links(request, "flavors", flavors, page),
     }
 
 
 @router.get("/v2.1/flavors/detail")
 async def list_flavors_detail(
-    auth: AuthContext = auth_dep, session: AsyncSession = Depends(get_session)
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    flavors = (await session.execute(select(Flavor).order_by(Flavor.ram))).scalars().all()
-    return {"flavors": [flavor_dict(f) for f in flavors]}
+    page = page_request(request.query_params, SERVICE)
+    stmt = await paginate(
+        session, select(Flavor), Flavor, page, sort_column=Flavor.ram, descending=False
+    )
+    flavors = list((await session.execute(stmt)).scalars().all())
+    return {
+        "flavors": [flavor_dict(f) for f in flavors],
+        **collection_links(request, "flavors", flavors, page),
+    }
 
 
 @router.post("/v2.1/flavors", status_code=200)
@@ -469,15 +506,14 @@ async def _list_servers(
         stmt = stmt.where(Server.name.like(f"%{params['name']}%"))
     if "status" in params:
         stmt = stmt.where(Server.status == params["status"].upper())
-    limit = int(params.get("limit", 1000))
-    servers = (
-        await session.execute(stmt.order_by(Server.created_at.desc()).limit(limit))
-    ).scalars().all()
+    page = page_request(params, SERVICE)
+    stmt = await paginate(session, stmt, Server, page, sort_column=Server.created_at)
+    servers = list((await session.execute(stmt)).scalars().all())
     for server in servers:
         resolve_server(server)
     await session.commit()
 
-    flavors, ports, networks, attachments = await _server_context(session, list(servers))
+    flavors, ports, networks, attachments = await _server_context(session, servers)
     return {
         "servers": [
             server_dict(
@@ -487,9 +523,11 @@ async def _list_servers(
                 networks,
                 attachments.get(s.id, []),
                 detail=detail,
+                request=request,
             )
             for s in servers
-        ]
+        ],
+        **collection_links(request, "servers", servers, page),
     }
 
 
@@ -645,6 +683,7 @@ async def _attach_networks(
 @router.get("/v2.1/servers/{server_id}")
 async def get_server(
     server_id: str,
+    request: Request,
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
@@ -658,6 +697,7 @@ async def get_server(
             ports.get(server.id, []),
             networks,
             attachments.get(server.id, []),
+            request=request,
         )
     }
 
@@ -666,6 +706,7 @@ async def get_server(
 async def update_server(
     server_id: str,
     body: dict[str, Any],
+    request: Request,
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
@@ -683,6 +724,7 @@ async def update_server(
             ports.get(server.id, []),
             networks,
             attachments.get(server.id, []),
+            request=request,
         )
     }
 
@@ -922,6 +964,7 @@ async def server_diagnostics(
 async def server_action(
     server_id: str,
     body: dict[str, Any],
+    request: Request,
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> Response:
@@ -1062,7 +1105,7 @@ async def server_action(
             {
                 "server": server_dict(
                     server, flavors.get(server.flavor_id), ports.get(server.id, []),
-                    networks, attachments.get(server.id, []),
+                    networks, attachments.get(server.id, []), request=request,
                 )
             },
             status_code=202,
@@ -1506,14 +1549,23 @@ async def quota_set(
         "metadata_items": 128,
         "server_groups": 10,
         "server_group_members": 10,
-        "injected_files": 5,
-        "injected_file_content_bytes": 10240,
-        "injected_file_path_bytes": 255,
-        "fixed_ips": -1,
-        "floating_ips": 50,
-        "security_groups": 100,
-        "security_group_rules": usage.conntrack_max,
     }
+    # Nova stopped proxying the network quotas at 2.36 and dropped the personality-file
+    # quotas with that feature at 2.57. Reporting them at a version that removed them is
+    # how code ends up reading a key the real cloud will not send.
+    if not at_least(request, "2.57"):
+        limits |= {
+            "injected_files": 5,
+            "injected_file_content_bytes": 10240,
+            "injected_file_path_bytes": 255,
+        }
+    if not at_least(request, "2.36"):
+        limits |= {
+            "fixed_ips": -1,
+            "floating_ips": 50,
+            "security_groups": 100,
+            "security_group_rules": usage.conntrack_max,
+        }
     if request.query_params.get("usage", "").lower() in ("true", "1"):
         in_use = {
             "cores": usage.vcpus_used,

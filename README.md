@@ -283,9 +283,23 @@ every byte. 13 MB of uploads leaves the SQLite file at ~620 KB.
 onto the row at read time; volumes, floating IPs, load balancers and objects are priced
 with `julianday()` age arithmetic inside SQLite. `(accumulated_seconds / 3600) * unit_cost`.
 
-**Microversion tolerance.** Modern versions (`compute 2.79`, `placement 1.36`,
-`volume 3.70`, `load-balancer 2.27`) are echoed on every response regardless of what the
-client negotiated.
+**Real microversion negotiation.** The `OpenStack-API-Version` header (and novaclient's
+older `X-OpenStack-Nova-API-Version`) is parsed, validated and *acted on*: the response
+carries the version actually served, an out-of-range version is refused with `406`, a
+malformed one with `400`, and — as on a real deployment — a request with no version header
+is served at the service **minimum**, not the maximum.
+
+That last part is the one that catches bugs. Nova's response has grown a field at a time,
+so a server read at 2.1 has no `locked`, `tags`, `description` or `host_status` and links
+to its flavor instead of embedding it; `os-quota-sets` drops the network quotas at 2.36
+and the personality-file quotas at 2.57. Code that forgets to pin a microversion sees
+exactly what the real cloud would send it.
+
+**Marker pagination.** Listings take `?limit=N&marker=<id>` and answer with
+`<collection>_links` (Glance: a flat `next`) while more remain, so an SDK paging through
+a collection terminates on a short page instead of re-reading page one forever. Paging is
+keyset-based, so it stays correct when resources are created or deleted mid-walk, and an
+unknown marker is a `400` rather than a silently empty page.
 
 ## Depletion model
 
@@ -476,6 +490,12 @@ Worth knowing before you trust it for something:
   Nova to generate one returns synthetic material. There is no VM to log in to either way.
 - **Not for exposure.** Plain HTTP, tokens that are opaque UUIDs rather than Fernet, and
   a seeded password of `secret`. Bind it to loopback and keep it there.
+- **Whole API families are still missing** inside the services that are simulated —
+  notably Cinder backups and volume metadata, Glance's image-import workflow and
+  metadefs, Neutron trunks/QoS/subnet pools, Octavia L7 policies and statistics, Nova
+  server groups and aggregates, Keystone groups and application credentials, Placement
+  writes, and CloudKitty's whole hashmap rate-configuration surface. Quotas are readable
+  but not settable. `docs/gaps.md` has the list.
 - **Services not simulated:** Heat, Barbican, Magnum, Manila, Ironic, Designate, Ceilometer.
 
 ## License

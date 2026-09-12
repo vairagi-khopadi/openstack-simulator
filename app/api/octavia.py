@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import gen_id, iso, now_utc, settle_transition, transition_deadline
 from app.core.database import get_session
+from app.core.pagination import collection_links, page_request, paginate
 from app.core.middleware import AuthContext, OSPayload, body_object, fault, require
 from app.models.loadbalancer import HealthMonitor, Listener, LoadBalancer, Member, Pool
 from app.models.network import Network, Subnet
@@ -320,7 +321,12 @@ async def list_loadbalancers(
     stmt = select(LoadBalancer).where(LoadBalancer.deleted.is_(False))
     if "name" in request.query_params:
         stmt = stmt.where(LoadBalancer.name == request.query_params["name"])
-    rows = (await session.execute(stmt.order_by(LoadBalancer.created_at))).scalars().all()
+    page = page_request(request.query_params, SERVICE)
+    stmt = await paginate(
+        session, stmt, LoadBalancer, page,
+        sort_column=LoadBalancer.created_at, descending=False,
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
     for row in rows:
         resolve(row)
     await session.commit()
@@ -328,7 +334,10 @@ async def list_loadbalancers(
     for row in rows:
         listeners, pools = await _children(session, row.id)
         result.append(lb_dict(row, listeners, pools))
-    return {"loadbalancers": result}
+    return {
+        "loadbalancers": result,
+        **collection_links(request, "loadbalancers", rows, page),
+    }
 
 
 @router.post("/loadbalancers", status_code=201)
@@ -553,15 +562,24 @@ async def loadbalancer_status(
 
 @router.get("/listeners")
 async def list_listeners(
-    auth: AuthContext = auth_dep, session: AsyncSession = Depends(get_session)
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    rows = (
-        await session.execute(select(Listener).where(Listener.deleted.is_(False)))
-    ).scalars().all()
+    page = page_request(request.query_params, SERVICE)
+    stmt = await paginate(
+        session,
+        select(Listener).where(Listener.deleted.is_(False)),
+        Listener, page, sort_column=Listener.created_at, descending=False,
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
     for row in rows:
         resolve(row)
     await session.commit()
-    return {"listeners": [listener_dict(r) for r in rows]}
+    return {
+        "listeners": [listener_dict(r) for r in rows],
+        **collection_links(request, "listeners", rows, page),
+    }
 
 
 @router.post("/listeners", status_code=201)
@@ -646,9 +664,17 @@ async def delete_listener(
 
 @router.get("/pools")
 async def list_pools(
-    auth: AuthContext = auth_dep, session: AsyncSession = Depends(get_session)
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    rows = (await session.execute(select(Pool).where(Pool.deleted.is_(False)))).scalars().all()
+    page = page_request(request.query_params, SERVICE)
+    stmt = await paginate(
+        session,
+        select(Pool).where(Pool.deleted.is_(False)),
+        Pool, page, sort_column=Pool.created_at, descending=False,
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
     for row in rows:
         resolve(row)
     await session.commit()
@@ -664,7 +690,7 @@ async def list_pools(
             ).scalars().all()
         )
         result.append(pool_dict(pool, members))
-    return {"pools": result}
+    return {"pools": result, **collection_links(request, "pools", rows, page)}
 
 
 @router.post("/pools", status_code=201)

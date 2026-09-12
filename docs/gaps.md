@@ -1,0 +1,141 @@
+# Gaps against real OpenStack
+
+What the real services expose that this simulator does not. Derived by enumerating the
+router table (`main.build_apps()`) and comparing it to the upstream API reference, so it
+describes routes that exist rather than features that were intended.
+
+The point of the list is to be honest about the edges: code written against the simulator
+should fail here, in a way you can see, rather than on a real cloud later.
+
+Status key: **done** · **next** · *(no marker)* not started.
+
+---
+
+## Cross-cutting — done
+
+These affected every service and are now implemented.
+
+- **done** — Microversion negotiation. `OpenStack-API-Version` and
+  `X-OpenStack-Nova-API-Version` are parsed, validated (`406` out of range, `400`
+  malformed), `latest` resolves, and the response reports the version actually served. A
+  request with no header is served at the service **minimum**, as a real deployment does.
+  Response bodies branch on it: see `app/core/microversion.py` and the gates in
+  `app/api/nova.py`.
+- **done** — Marker pagination. `?limit=N&marker=<id>` with `<collection>_links`
+  (Glance's flat `next`/`first`), keyset-based, on every major collection. See
+  `app/core/pagination.py`.
+
+Still open, cross-cutting:
+
+- **Sorting.** No `sort_key` / `sort_dir` on any listing.
+- **Field selection.** No `fields=` to trim a response.
+- **Tags.** No tags API on any resource — Neutron resource tags, Nova server tags
+  (`/servers/{id}/tags`), Glance image tags.
+- **Unified limits.** Keystone `/v3/limits` and `/v3/registered_limits`, the modern
+  replacement for per-service quota APIs.
+- **RBAC.** Project isolation is modelled; per-role authorisation is not. A `reader`
+  token can do anything a `member` can inside its own project.
+
+---
+
+## Quotas — next
+
+The thread that started this list. Quotas are readable and derived from host capacity;
+nothing can set them.
+
+| Endpoint | Note |
+| --- | --- |
+| `GET /v2.1/os-quota-sets/{project}/detail` | what `openstack quota show --usage` actually calls; the usage data already exists behind a `?usage=` query parameter nothing sends |
+| `GET /v2.1/os-quota-sets/{project}/defaults` | needed by `openstack quota list` |
+| `PUT /v2.1/os-quota-sets/{project}` | needs a stored-override model, and a decision on whether an override caps the depletion model or only reports |
+| `DELETE /v2.1/os-quota-sets/{project}` | revert to defaults |
+| Cinder and Neutron equivalents | `/v3/os-quota-sets/{p}/defaults`, `PUT`; Neutron `PUT /v2.0/quotas/{p}`, `/quotas` list, `/quotas/{p}/default` |
+| `os-quota-class-sets` | class-level defaults |
+
+---
+
+## Per service
+
+### Keystone
+
+Groups and group role assignments · application credentials · `/v3/credentials` · trusts
+(OS-TRUST) · EC2 credentials · federation · system-scoped tokens · password change
+(`POST /v3/users/{id}/password`) · project tags · project hierarchy (`parent_id`).
+
+CRUD is read-only for services, endpoints, domains and regions. Role assignment has `PUT`
+but no revoke, no `HEAD` check, no domain- or group-scoped assignments.
+
+### Nova
+
+Server groups (anti-affinity) · host aggregates · migrations (`/os-migrations`,
+`/servers/{id}/migrations`) · instance actions (`/servers/{id}/os-instance-actions`) ·
+remote consoles (`/servers/{id}/remote-consoles` — note `os-getConsoleOutput` *is*
+supported as a server action) · server tags · interface attach/detach (only `GET
+/os-interface` exists) · flavor update and `os-flavor-access` · extra-specs writes ·
+volume-attachment update (swap) · server password.
+
+Correctly absent: `os-floating-ips` and Nova-side security-group CRUD — real Nova removed
+both at microversion 2.36.
+
+### Cinder
+
+Backups · volume and snapshot metadata · volume transfers · consistency groups and group
+types · QoS specs · volume-type extra specs and encryption · `/v3/messages` ·
+`os-services` / `os-hosts` · manage/unmanage · default types.
+
+Volume actions stop at `os-attach`, `os-detach`, `os-extend`, `os-reset_status`,
+`os-set_bootable` — no retype, migrate, upload-to-image or revert-to-snapshot.
+
+### Glance
+
+Image import workflow (`/v2/images/{id}/import`, `/v2/info/import`, staging) — the modern
+upload path · tasks API · metadata definitions (`/v2/metadefs/*`) · image tags ·
+multi-store (`/v2/info/stores`) · cache API.
+
+Member sharing is read-only: `GET /members` with no share, accept, reject or delete.
+
+### Neutron
+
+Trunks · QoS policies and rules · subnet pools · RBAC policies · address scopes and
+groups · segments · FWaaS · VPNaaS · agents and agent scheduling · floating-IP port
+forwarding · extra routes · network IP availability · auto-allocated topology.
+
+Note `subnetpool` and `rbac_policy` are *counted in the quota response* while having no
+endpoints behind them.
+
+### Placement
+
+Effectively read-only. No resource-provider create/update/delete, no inventory writes, no
+trait writes, no aggregate writes, no `POST /reshaper`, no nested providers. Only
+`/allocations/{consumer}` accepts `PUT` and `DELETE`.
+
+### Octavia
+
+L7 policies and rules · statistics (`/loadbalancers/{id}/stats`, `/listeners/{id}/stats`)
+· amphorae · failover · quotas · flavor profiles · availability zones · health-monitor
+update · batch member update.
+
+### Swift
+
+Bulk delete · large objects (SLO/DLO manifests) · object versioning · temp URLs and form
+POST · container ACLs and sync · `COPY` · expiring objects (`X-Delete-After`).
+
+### CloudKitty
+
+The entire rate-configuration surface: `/v1/rating/module_config/hashmap/*` (services,
+fields, mappings, thresholds, groups) and the pyscripts module — so rates are settable
+only through `OPENSTACK_SIMULATOR_RATE_*` environment variables. No v2 API
+(`/v2/summary`, `/v2/dataframes`, scope state).
+
+---
+
+## Known behavioural quirks
+
+Not missing endpoints, but places where a present endpoint behaves unlike the real one.
+
+- **`?status=` filters on stored state.** Transitions resolve lazily at read time, so a
+  server whose build window has elapsed is still stored as `BUILD` until something reads
+  it. `GET /v2.1/servers?status=ACTIVE` filters in SQL and therefore misses it, where a
+  real cloud would return it.
+- Glance and Octavia do not scope listings to the caller's project (see README
+  Limitations).

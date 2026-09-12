@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import gen_id, iso_us, now_utc, settings
 from app.core.database import get_session
+from app.core.pagination import collection_links, page_request, paginate
 from app.core.middleware import AuthContext, OSPayload, body_object, fault, require
 from app.models.network import (
     FloatingIP,
@@ -425,11 +426,16 @@ async def list_networks(
         stmt = stmt.where(Network.id == params["id"])
     if "router:external" in params:
         stmt = stmt.where(Network.external.is_(params["router:external"].lower() == "true"))
-    networks = (await session.execute(stmt.order_by(Network.created_at))).scalars().all()
+    page = page_request(request.query_params, SERVICE)
+    stmt = await paginate(
+        session, stmt, Network, page, sort_column=Network.created_at, descending=False
+    )
+    networks = list((await session.execute(stmt)).scalars().all())
     return {
         "networks": [
             network_dict(n, await _subnet_ids(session, n.id)) for n in networks
-        ]
+        ],
+        **collection_links(request, "networks", networks, page),
     }
 
 
@@ -543,8 +549,15 @@ async def list_subnets(
         stmt = stmt.where(Subnet.network_id == request.query_params["network_id"])
     if "name" in request.query_params:
         stmt = stmt.where(Subnet.name == request.query_params["name"])
-    subnets = (await session.execute(stmt.order_by(Subnet.created_at))).scalars().all()
-    return {"subnets": [subnet_dict(s) for s in subnets]}
+    page = page_request(request.query_params, SERVICE)
+    stmt = await paginate(
+        session, stmt, Subnet, page, sort_column=Subnet.created_at, descending=False
+    )
+    subnets = list((await session.execute(stmt)).scalars().all())
+    return {
+        "subnets": [subnet_dict(s) for s in subnets],
+        **collection_links(request, "subnets", subnets, page),
+    }
 
 
 @router.post("/v2.0/subnets", status_code=201)
@@ -668,8 +681,15 @@ async def list_ports(
             stmt = stmt.where(Port.ip_address == value)
     if "name" in params:
         stmt = stmt.where(Port.name == params["name"])
-    ports = (await session.execute(stmt.order_by(Port.created_at))).scalars().all()
-    return {"ports": [port_dict(p) for p in ports]}
+    page = page_request(request.query_params, SERVICE)
+    stmt = await paginate(
+        session, stmt, Port, page, sort_column=Port.created_at, descending=False
+    )
+    ports = list((await session.execute(stmt)).scalars().all())
+    return {
+        "ports": [port_dict(p) for p in ports],
+        **collection_links(request, "ports", ports, page),
+    }
 
 
 @router.post("/v2.0/ports", status_code=201)
@@ -771,8 +791,16 @@ async def list_security_groups(
     stmt = scope_to_project(select(SecurityGroup), SecurityGroup, auth, request)
     if "name" in request.query_params:
         stmt = stmt.where(SecurityGroup.name == request.query_params["name"])
-    groups = (await session.execute(stmt.order_by(SecurityGroup.created_at))).scalars().all()
-    return {"security_groups": [security_group_dict(g) for g in groups]}
+    page = page_request(request.query_params, SERVICE)
+    stmt = await paginate(
+        session, stmt, SecurityGroup, page,
+        sort_column=SecurityGroup.created_at, descending=False,
+    )
+    groups = list((await session.execute(stmt)).scalars().all())
+    return {
+        "security_groups": [security_group_dict(g) for g in groups],
+        **collection_links(request, "security_groups", groups, page),
+    }
 
 
 @router.post("/v2.0/security-groups", status_code=201)
@@ -873,8 +901,16 @@ async def list_security_group_rules(
             SecurityGroupRule.security_group_id
             == request.query_params["security_group_id"]
         )
-    rules = (await session.execute(stmt)).scalars().all()
-    return {"security_group_rules": [rule_dict(r) for r in rules]}
+    page = page_request(request.query_params, SERVICE)
+    stmt = await paginate(
+        session, stmt, SecurityGroupRule, page,
+        sort_column=SecurityGroupRule.created_at, descending=False,
+    )
+    rules = list((await session.execute(stmt)).scalars().all())
+    return {
+        "security_group_rules": [rule_dict(r) for r in rules],
+        **collection_links(request, "security_group_rules", rules, page),
+    }
 
 
 @router.post("/v2.0/security-group-rules", status_code=201)
@@ -964,8 +1000,16 @@ async def list_floating_ips(
         stmt = stmt.where(
             FloatingIP.floating_ip_address == params["floating_ip_address"]
         )
-    fips = (await session.execute(stmt.order_by(FloatingIP.created_at))).scalars().all()
-    return {"floatingips": [floating_ip_dict(f) for f in fips]}
+    page = page_request(request.query_params, SERVICE)
+    stmt = await paginate(
+        session, stmt, FloatingIP, page,
+        sort_column=FloatingIP.created_at, descending=False,
+    )
+    fips = list((await session.execute(stmt)).scalars().all())
+    return {
+        "floatingips": [floating_ip_dict(f) for f in fips],
+        **collection_links(request, "floatingips", fips, page),
+    }
 
 
 @router.post("/v2.0/floatingips", status_code=201)
@@ -1220,11 +1264,16 @@ async def list_routers(
     stmt = scope_to_project(select(Router), Router, auth, request)
     if "name" in request.query_params:
         stmt = stmt.where(Router.name == request.query_params["name"])
-    routers = (await session.execute(stmt.order_by(Router.created_at))).scalars().all()
+    page = page_request(request.query_params, SERVICE)
+    stmt = await paginate(
+        session, stmt, Router, page, sort_column=Router.created_at, descending=False
+    )
+    routers = list((await session.execute(stmt)).scalars().all())
     return {
         "routers": [
             router_dict(r, await _router_ports(session, r.id)) for r in routers
-        ]
+        ],
+        **collection_links(request, "routers", routers, page),
     }
 
 

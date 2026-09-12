@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import gen_id, iso, now_utc, service_url
 from app.core.database import get_session
+from app.core.pagination import glance_links, page_request, paginate
 from app.core.middleware import AuthContext, OSPayload, fault, require
 from app.models.storage import Image
 
@@ -183,13 +184,12 @@ async def list_images(
         stmt = stmt.where(Image.status == params["status"])
     if "visibility" in params:
         stmt = stmt.where(Image.visibility == params["visibility"])
-    limit = int(params.get("limit", 100))
-    images = (
-        await session.execute(stmt.order_by(Image.created_at.desc()).limit(limit))
-    ).scalars().all()
+    page = page_request(params, SERVICE)
+    stmt = await paginate(session, stmt, Image, page, sort_column=Image.created_at)
+    images = list((await session.execute(stmt)).scalars().all())
     return {
         "images": [image_dict(i) for i in images],
-        "first": "/v2/images",
+        **glance_links(request, "/v2/images", images, page),
         "schema": "/v2/schemas/images",
     }
 

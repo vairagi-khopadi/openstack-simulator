@@ -233,7 +233,9 @@ CATALOG_LAYOUT: list[tuple[str, str, str, str]] = [
     ("cloudkitty", "rating", "cloudkitty", "/v1"),
 ]
 
-# Microversion headers echoed back regardless of what the client negotiated.
+# The microversion range each service advertises. app/core/microversion.py
+# negotiates within it -- a request with no version header is served at the minimum,
+# as a real deployment would serve it.
 API_VERSIONS: dict[str, tuple[str, str, str]] = {
     # service key -> (service name used in OpenStack-API-Version, min, max)
     "nova": ("compute", "2.1", "2.79"),

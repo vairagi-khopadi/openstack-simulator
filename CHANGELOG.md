@@ -15,6 +15,19 @@ Two numbers move independently:
 
 ### Added
 
+- **Microversion negotiation is real.** `OpenStack-API-Version` (and novaclient's
+  `X-OpenStack-Nova-API-Version`) is parsed and validated, `latest` is understood, the
+  response reports the version actually served, an unsupported version returns `406` and
+  a malformed one `400`. Handlers branch on the negotiated version: Nova's server body
+  gates `locked` (2.9), `host_status` (2.16), `description` (2.19), `tags` (2.26),
+  `trusted_image_certificates` (2.63) and `server_groups` (2.71), embeds the flavor only
+  from 2.47, and `os-quota-sets` drops the network quotas at 2.36 and the personality-file
+  quotas at 2.57.
+- **Marker pagination** on servers, flavors, volumes, snapshots, images, networks,
+  subnets, ports, routers, floating IPs, security groups and rules, load balancers,
+  listeners and pools. `?limit=N&marker=<id>` with a `<collection>_links` next link
+  (Glance's flat `next`/`first` for images), keyset-based so it survives concurrent
+  writes, emitted only while more remain, and `400` on an unknown marker.
 - `main.py --database` / `seed.py --database` (`-D`), and the matching
   `OPENSTACK_SIMULATOR_DATABASE` variable, to run against a chosen database file — one
   per environment, so a `dev.db` and a `prod.db` keep entirely separate clouds. Accepts a
@@ -26,6 +39,12 @@ Two numbers move independently:
   every environment, so nothing else distinguishes them.
 - Startup warns when the chosen database has no identity seeded yet, naming the
   `seed.py --database …` command, instead of leaving every request to fail with `401`.
+
+### Changed
+
+- A request that sends no microversion header is now served at the service **minimum**
+  rather than the maximum, matching a real deployment. Pin a version — as `openrc.sh` and
+  `clouds.yaml` already do — to get the modern response shapes.
 
 ## [0.1.0] — 2026-09-11
 

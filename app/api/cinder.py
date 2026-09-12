@@ -19,6 +19,7 @@ from app.core.config import (
     transition_deadline,
 )
 from app.core.database import get_session
+from app.core.pagination import collection_links, page_request, paginate
 from app.core.middleware import AuthContext, OSPayload, fault, require
 from app.models.compute import Server
 from app.models.storage import Snapshot, Volume, VolumeAttachment, VolumeType
@@ -262,10 +263,9 @@ async def _list_volumes(
         stmt = stmt.where(Volume.name == params["name"])
     if "status" in params:
         stmt = stmt.where(Volume.status == params["status"])
-    limit = int(params.get("limit", 1000))
-    volumes = (
-        await session.execute(stmt.order_by(Volume.created_at.desc()).limit(limit))
-    ).scalars().all()
+    page = page_request(params, SERVICE)
+    stmt = await paginate(session, stmt, Volume, page, sort_column=Volume.created_at)
+    volumes = list((await session.execute(stmt)).scalars().all())
     for volume in volumes:
         resolve_volume(volume)
     await session.commit()
@@ -281,10 +281,14 @@ async def _list_volumes(
                     ],
                 }
                 for v in volumes
-            ]
+            ],
+            **collection_links(request, "volumes", volumes, page),
         }
     attachments = await _attachments_for(session, [v.id for v in volumes])
-    return {"volumes": [volume_dict(v, attachments.get(v.id, [])) for v in volumes]}
+    return {
+        "volumes": [volume_dict(v, attachments.get(v.id, [])) for v in volumes],
+        **collection_links(request, "volumes", volumes, page),
+    }
 
 
 @router.get("/v3/volumes")
@@ -621,19 +625,23 @@ async def delete_type(
 @router.get("/v3/snapshots")
 @router.get("/v3/snapshots/detail")
 async def list_snapshots(
-    auth: AuthContext = auth_dep, session: AsyncSession = Depends(get_session)
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    rows = (
-        await session.execute(
-            select(Snapshot).where(
-                Snapshot.deleted.is_(False), Snapshot.project_id == auth.project_id
-            )
-        )
-    ).scalars().all()
+    stmt = select(Snapshot).where(
+        Snapshot.deleted.is_(False), Snapshot.project_id == auth.project_id
+    )
+    page = page_request(request.query_params, SERVICE)
+    stmt = await paginate(session, stmt, Snapshot, page, sort_column=Snapshot.created_at)
+    rows = list((await session.execute(stmt)).scalars().all())
     for snapshot in rows:
         resolve_snapshot(snapshot)
     await session.commit()
-    return {"snapshots": [snapshot_dict(s) for s in rows]}
+    return {
+        "snapshots": [snapshot_dict(s) for s in rows],
+        **collection_links(request, "snapshots", rows, page),
+    }
 
 
 @router.post("/v3/snapshots", status_code=202)
