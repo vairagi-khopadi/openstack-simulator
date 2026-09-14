@@ -56,8 +56,26 @@ class Hypervisor(Base):
     reserved_memory_mb: Mapped[int] = mapped_column(Integer, default=512)
     reserved_disk_gb: Mapped[int] = mapped_column(Integer, default=0)
     conntrack_max: Mapped[int] = mapped_column(Integer, default=65536)
+    # Placement decorates the provider with these; both are per-provider lists that an
+    # operator sets, not anything derived from the hardware.
+    traits: Mapped[list[str]] = mapped_column(JSON, default=list)
+    aggregates: Mapped[list[str]] = mapped_column(JSON, default=list)
 
     cpu_info: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+
+
+class PlacementRegistry(Base):
+    """Custom traits and resource classes, which are cloud-wide rather than per-provider.
+
+    Placement ships a fixed set of standard names and lets an operator add ``CUSTOM_``
+    ones. Only the custom ones are stored; the standard list is a constant.
+    """
+
+    __tablename__ = "placement_registry"
+
+    name: Mapped[str] = mapped_column(String(255), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)  # trait | resource_class
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
 
 

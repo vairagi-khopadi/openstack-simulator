@@ -23,6 +23,11 @@ Two numbers move independently:
   `trusted_image_certificates` (2.63) and `server_groups` (2.71), embeds the flavor only
   from 2.47, and `os-quota-sets` drops the network quotas at 2.36 and the personality-file
   quotas at 2.57.
+- **Placement writes**: custom traits, provider traits and aggregates, and custom
+  resource classes — with the `CUSTOM_` namespace enforced, standard names protected from
+  deletion, and a trait still set on a provider refusing to be deleted. Resource provider
+  create/delete stays deliberately unimplemented: there is one node, and a provider
+  nothing can schedule to would be a fiction.
 - **Keystone groups** (`/v3/groups`, membership, and
   `/v3/projects/{p}/groups/{g}/roles/{r}`): a role granted to a group is resolved through
   membership when a token is issued rather than copied onto each user, so joining grants

@@ -7,6 +7,7 @@ from app.models.compute import (
     Flavor,
     Hypervisor,
     Keypair,
+    PlacementRegistry,
     Server,
     ServerGroup,
 )
@@ -87,6 +88,7 @@ __all__ = [
     "Member",
     "Network",
     "ObjectMetadata",
+    "PlacementRegistry",
     "Pool",
     "Port",
     "Project",

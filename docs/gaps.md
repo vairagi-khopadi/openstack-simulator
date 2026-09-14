@@ -132,9 +132,16 @@ network IP availability · auto-allocated topology.
 
 ### Placement
 
-Effectively read-only. No resource-provider create/update/delete, no inventory writes, no
-trait writes, no aggregate writes, no `POST /reshaper`, no nested providers. Only
-`/allocations/{consumer}` accepts `PUT` and `DELETE`.
+**done** — Custom traits (`PUT`/`GET`/`DELETE /traits/{name}`), provider traits
+(`PUT`/`DELETE /resource_providers/{uuid}/traits`), provider aggregates, and custom
+resource classes. Standard names are protected and a trait in use cannot be deleted.
+
+**Deliberately not implemented** — resource provider create/update/delete and nested
+providers. The simulator has one node by design (see README Limitations), and a second
+provider that nothing could ever schedule to would be a fiction rather than a gap.
+
+Still open: inventory writes (inventory is derived from the node's hardware) ·
+`POST /reshaper`.
 
 ### Octavia
 

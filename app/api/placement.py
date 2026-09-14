@@ -5,6 +5,7 @@ never disagree with the hypervisor view.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -14,7 +15,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import API_VERSIONS, service_url
 from app.core.database import get_session
 from app.core.middleware import AuthContext, fault, require
-from app.models.compute import STATES_HOLDING_COMPUTE, STATES_HOLDING_DISK, Server
+from app.models.compute import (
+    STATES_HOLDING_COMPUTE,
+    STATES_HOLDING_DISK,
+    PlacementRegistry,
+    Server,
+)
 from app.services.capacity import (
     RC_DISK_GB,
     RC_MEMORY_MB,
@@ -187,8 +193,11 @@ async def get_aggregates(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    await _require_provider(session, uuid)
-    return {"aggregates": [], "resource_provider_generation": await _generation(session)}
+    host = await _require_provider(session, uuid)
+    return {
+        "aggregates": list(host.aggregates or []),
+        "resource_provider_generation": await _generation(session),
+    }
 
 
 @router.get("/resource_providers/{uuid}/traits")
@@ -197,8 +206,10 @@ async def get_traits(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    await _require_provider(session, uuid)
-    return {"traits": TRAITS, "resource_provider_generation": await _generation(session)}
+    host = await _require_provider(session, uuid)
+    # The node's hardware traits, plus whatever an operator has set on the provider.
+    traits = list(dict.fromkeys([*TRAITS, *(host.traits or [])]))
+    return {"traits": traits, "resource_provider_generation": await _generation(session)}
 
 
 @router.get("/resource_providers/{uuid}/allocations")
@@ -310,16 +321,21 @@ async def get_usages(
 
 
 @router.get("/traits")
-async def list_traits(auth: AuthContext = auth_dep) -> dict[str, Any]:
-    return {"traits": TRAITS}
+async def list_traits(
+    auth: AuthContext = auth_dep, session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    return {"traits": [*TRAITS, *await _custom(session, "trait")]}
 
 
 @router.get("/resource_classes")
-async def list_resource_classes(auth: AuthContext = auth_dep) -> dict[str, Any]:
+async def list_resource_classes(
+    auth: AuthContext = auth_dep, session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    standard = (RC_VCPU, RC_MEMORY_MB, RC_DISK_GB, "PCPU", "IPV4_ADDRESS")
     return {
         "resource_classes": [
             {"name": name, "links": [{"rel": "self", "href": f"/resource_classes/{name}"}]}
-            for name in (RC_VCPU, RC_MEMORY_MB, RC_DISK_GB, "PCPU", "IPV4_ADDRESS")
+            for name in (*standard, *await _custom(session, "resource_class"))
         ]
     }
 
@@ -369,3 +385,200 @@ async def allocation_candidates(
             }
         },
     }
+
+
+# --------------------------------------------------------------------------------------
+# Traits, aggregates and resource classes (writes)
+# --------------------------------------------------------------------------------------
+
+# Placement only lets an operator invent names in the CUSTOM_ namespace; the standard
+# ones are defined by the service and cannot be added to or removed.
+CUSTOM_PREFIX = "CUSTOM_"
+_CUSTOM_NAME = re.compile(r"^CUSTOM_[A-Z0-9_]+$")
+
+
+async def _custom(session: AsyncSession, kind: str) -> list[str]:
+    return list(
+        (
+            await session.execute(
+                select(PlacementRegistry.name).where(PlacementRegistry.kind == kind)
+            )
+        ).scalars().all()
+    )
+
+
+def _reject_non_custom(name: str, kind: str) -> None:
+    if not _CUSTOM_NAME.match(name):
+        raise fault(
+            SERVICE,
+            400,
+            f"The {kind} name {name} is invalid: only CUSTOM_ names in upper case, "
+            f"digits and underscores can be created.",
+            code="placement.invalid_name",
+        )
+
+
+@router.put("/traits/{name}")
+async def create_trait(
+    name: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """201 the first time, 204 thereafter -- Placement distinguishes the two."""
+    _reject_non_custom(name, "trait")
+    existing = await session.get(PlacementRegistry, name)
+    if existing is not None:
+        return Response(status_code=204)
+    session.add(PlacementRegistry(name=name, kind="trait"))
+    await session.commit()
+    return Response(status_code=201)
+
+
+@router.get("/traits/{name}", status_code=204)
+async def get_trait(
+    name: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    if name in TRAITS or await session.get(PlacementRegistry, name) is not None:
+        return Response(status_code=204)
+    raise fault(SERVICE, 404, f"No such trait {name}",
+                code="placement.trait.not_found")
+
+
+@router.delete("/traits/{name}", status_code=204)
+async def delete_trait(
+    name: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    if name in TRAITS:
+        raise fault(
+            SERVICE,
+            400,
+            f"Cannot delete standard trait {name}.",
+            code="placement.trait.cannot_delete",
+        )
+    trait = await session.get(PlacementRegistry, name)
+    if trait is None or trait.kind != "trait":
+        raise fault(SERVICE, 404, f"No such trait {name}",
+                    code="placement.trait.not_found")
+    # A trait still on a provider would leave that provider advertising something the
+    # cloud no longer defines.
+    host = await get_host(session)
+    if name in (host.traits or []):
+        raise fault(
+            SERVICE,
+            409,
+            f"Trait {name} is in use by a resource provider.",
+            code="placement.trait.in_use",
+        )
+    await session.delete(trait)
+    await session.commit()
+    return Response(status_code=204)
+
+
+@router.put("/resource_providers/{uuid}/traits")
+async def set_provider_traits(
+    uuid: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Replace the provider's trait list wholesale, as Placement's PUT does."""
+    host = await _require_provider(session, uuid)
+    wanted = list((body or {}).get("traits") or [])
+    known = set(TRAITS) | set(await _custom(session, "trait"))
+    unknown = [name for name in wanted if name not in known]
+    if unknown:
+        raise fault(
+            SERVICE,
+            400,
+            f"No such trait(s): {', '.join(sorted(unknown))}.",
+            code="placement.trait.not_found",
+        )
+    host.traits = wanted
+    await session.commit()
+    return {
+        "resource_provider_generation": await _generation(session),
+        "traits": wanted,
+    }
+
+
+@router.delete("/resource_providers/{uuid}/traits", status_code=204)
+async def clear_provider_traits(
+    uuid: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    host = await _require_provider(session, uuid)
+    host.traits = []
+    await session.commit()
+    return Response(status_code=204)
+
+
+@router.put("/resource_providers/{uuid}/aggregates")
+async def set_provider_aggregates(
+    uuid: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    host = await _require_provider(session, uuid)
+    aggregates = list((body or {}).get("aggregates") or [])
+    host.aggregates = aggregates
+    await session.commit()
+    return {
+        "aggregates": aggregates,
+        "resource_provider_generation": await _generation(session),
+    }
+
+
+@router.put("/resource_classes/{name}")
+async def create_resource_class(
+    name: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    _reject_non_custom(name, "resource class")
+    existing = await session.get(PlacementRegistry, name)
+    if existing is not None:
+        return Response(status_code=204)
+    session.add(PlacementRegistry(name=name, kind="resource_class"))
+    await session.commit()
+    return Response(status_code=201)
+
+
+@router.get("/resource_classes/{name}")
+async def get_resource_class(
+    name: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    standard = (RC_VCPU, RC_MEMORY_MB, RC_DISK_GB, "PCPU", "IPV4_ADDRESS")
+    if name not in standard and await session.get(PlacementRegistry, name) is None:
+        raise fault(SERVICE, 404, f"No such resource class {name}",
+                    code="placement.resource_class.not_found")
+    return {"name": name, "links": [{"rel": "self", "href": f"/resource_classes/{name}"}]}
+
+
+@router.delete("/resource_classes/{name}", status_code=204)
+async def delete_resource_class(
+    name: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    if not name.startswith(CUSTOM_PREFIX):
+        raise fault(
+            SERVICE,
+            400,
+            f"Cannot delete standard resource class {name}.",
+            code="placement.resource_class.cannot_delete",
+        )
+    entry = await session.get(PlacementRegistry, name)
+    if entry is None or entry.kind != "resource_class":
+        raise fault(SERVICE, 404, f"No such resource class {name}",
+                    code="placement.resource_class.not_found")
+    await session.delete(entry)
+    await session.commit()
+    return Response(status_code=204)
