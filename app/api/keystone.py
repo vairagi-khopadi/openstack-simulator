@@ -1,7 +1,7 @@
 """Keystone Identity v3 (port 5000): tokens, projects, users, roles, service catalog."""
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, Request, Response
@@ -23,7 +23,18 @@ from app.core.config import (
 )
 from app.core.database import get_session
 from app.core.middleware import AuthContext, OSPayload, fault, require, resolve_token
-from app.models.identity import Endpoint, Project, Role, RoleAssignment, Service, Token, User
+from app.models.identity import (
+    ApplicationCredential,
+    Endpoint,
+    Group,
+    GroupMembership,
+    Project,
+    Role,
+    RoleAssignment,
+    Service,
+    Token,
+    User,
+)
 
 SERVICE = "keystone"
 router = APIRouter()
@@ -175,10 +186,30 @@ async def _lookup_project(session: AsyncSession, spec: dict[str, Any]) -> Projec
 
 
 async def _roles_for(session: AsyncSession, user_id: str, project_id: str) -> list[Role]:
+    """Every role this user holds on this project, directly or through a group.
+
+    Group assignments are resolved here rather than copied onto the user, so adding
+    someone to a group grants the roles immediately and removing them takes them away --
+    which is the only reason to use a group instead of assigning directly.
+    """
+    group_ids = list(
+        (
+            await session.execute(
+                select(GroupMembership.group_id).where(
+                    GroupMembership.user_id == user_id
+                )
+            )
+        ).scalars().all()
+    )
     stmt = (
         select(Role)
         .join(RoleAssignment, RoleAssignment.role_id == Role.id)
-        .where(RoleAssignment.user_id == user_id, RoleAssignment.project_id == project_id)
+        .where(
+            RoleAssignment.project_id == project_id,
+            (RoleAssignment.user_id == user_id)
+            | RoleAssignment.group_id.in_(group_ids or [""]),
+        )
+        .distinct()
     )
     roles = list((await session.execute(stmt)).scalars().all())
     if roles:
@@ -706,3 +737,394 @@ async def list_endpoints(
         ],
         "links": {"self": service_url(SERVICE, "/v3/endpoints")},
     }
+
+
+# --------------------------------------------------------------------------------------
+# Groups
+# --------------------------------------------------------------------------------------
+
+
+def group_dict(group: Group) -> dict[str, Any]:
+    return {
+        "id": group.id,
+        "name": group.name,
+        "domain_id": group.domain_id,
+        "description": group.description,
+        "links": {"self": service_url(SERVICE, f"/v3/groups/{group.id}")},
+    }
+
+
+async def _get_group(session: AsyncSession, group_id: str) -> Group:
+    group = await session.get(Group, group_id)
+    if group is None:
+        raise fault(SERVICE, 404, f"Could not find group: {group_id}")
+    return group
+
+
+async def _group_user_ids(session: AsyncSession, group_id: str) -> list[str]:
+    return list(
+        (
+            await session.execute(
+                select(GroupMembership.user_id).where(
+                    GroupMembership.group_id == group_id
+                )
+            )
+        ).scalars().all()
+    )
+
+
+@router.get("/v3/groups")
+async def list_groups(
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    stmt = select(Group)
+    if "name" in request.query_params:
+        stmt = stmt.where(Group.name == request.query_params["name"])
+    groups = (await session.execute(stmt.order_by(Group.created_at))).scalars().all()
+    return {"groups": [group_dict(g) for g in groups],
+            "links": {"self": service_url(SERVICE, "/v3/groups")}}
+
+
+@router.post("/v3/groups", status_code=201)
+async def create_group(
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    payload = (body or {}).get("group") or {}
+    name = payload.get("name")
+    if not name:
+        raise fault(SERVICE, 400, "A group requires a name.")
+    domain_id = payload.get("domain_id", DOMAIN_ID)
+    clash = (
+        await session.execute(
+            select(Group).where(Group.name == name, Group.domain_id == domain_id)
+        )
+    ).scalar_one_or_none()
+    if clash is not None:
+        raise fault(SERVICE, 409, f"Conflict occurred attempting to store group: {name}")
+
+    group = Group(
+        id=gen_id(),
+        name=name,
+        domain_id=domain_id,
+        description=payload.get("description", ""),
+    )
+    session.add(group)
+    await session.commit()
+    return {"group": group_dict(group)}
+
+
+@router.get("/v3/groups/{group_id}")
+async def get_group(
+    group_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    return {"group": group_dict(await _get_group(session, group_id))}
+
+
+@router.patch("/v3/groups/{group_id}")
+async def update_group(
+    group_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    group = await _get_group(session, group_id)
+    payload = (body or {}).get("group") or {}
+    for field in ("name", "description"):
+        if field in payload:
+            setattr(group, field, payload[field])
+    await session.commit()
+    return {"group": group_dict(group)}
+
+
+@router.delete("/v3/groups/{group_id}", status_code=204)
+async def delete_group(
+    group_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    group = await _get_group(session, group_id)
+    # Memberships have an ON DELETE CASCADE foreign key, so the database removes them.
+    # Role assignments reference the group by plain id and have to go explicitly; the
+    # users keep only what was granted to them directly.
+    for assignment in (
+        await session.execute(
+            select(RoleAssignment).where(RoleAssignment.group_id == group.id)
+        )
+    ).scalars().all():
+        await session.delete(assignment)
+    await session.delete(group)
+    await session.commit()
+    return Response(status_code=204)
+
+
+@router.get("/v3/groups/{group_id}/users")
+async def list_group_users(
+    group_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    await _get_group(session, group_id)
+    user_ids = await _group_user_ids(session, group_id)
+    users = (
+        await session.execute(select(User).where(User.id.in_(user_ids or [""])))
+    ).scalars().all()
+    return {"users": [user_dict(u) for u in users]}
+
+
+@router.put("/v3/groups/{group_id}/users/{user_id}", status_code=204)
+async def add_user_to_group(
+    group_id: str,
+    user_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    await _get_group(session, group_id)
+    user = await session.get(User, user_id)
+    if user is None:
+        raise fault(SERVICE, 404, f"Could not find user: {user_id}")
+    existing = (
+        await session.execute(
+            select(GroupMembership).where(
+                GroupMembership.group_id == group_id, GroupMembership.user_id == user_id
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        session.add(GroupMembership(id=gen_id(), group_id=group_id, user_id=user_id))
+        await session.commit()
+    return Response(status_code=204)
+
+
+@router.head("/v3/groups/{group_id}/users/{user_id}", status_code=204)
+@router.get("/v3/groups/{group_id}/users/{user_id}", status_code=204)
+async def check_group_membership(
+    group_id: str,
+    user_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Keystone answers membership with a bare 204 or 404, carrying no body."""
+    await _get_group(session, group_id)
+    if user_id not in await _group_user_ids(session, group_id):
+        raise fault(SERVICE, 404, f"User {user_id} is not a member of group {group_id}")
+    return Response(status_code=204)
+
+
+@router.delete("/v3/groups/{group_id}/users/{user_id}", status_code=204)
+async def remove_user_from_group(
+    group_id: str,
+    user_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    await _get_group(session, group_id)
+    membership = (
+        await session.execute(
+            select(GroupMembership).where(
+                GroupMembership.group_id == group_id, GroupMembership.user_id == user_id
+            )
+        )
+    ).scalar_one_or_none()
+    if membership is None:
+        raise fault(SERVICE, 404, f"User {user_id} is not a member of group {group_id}")
+    await session.delete(membership)
+    await session.commit()
+    return Response(status_code=204)
+
+
+@router.put(
+    "/v3/projects/{project_id}/groups/{group_id}/roles/{role_id}", status_code=204
+)
+async def grant_group_role(
+    project_id: str,
+    group_id: str,
+    role_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Grant a role to every member of a group at once, present and future."""
+    await _get_group(session, group_id)
+    if await session.get(Role, role_id) is None:
+        raise fault(SERVICE, 404, f"Could not find role: {role_id}")
+    existing = (
+        await session.execute(
+            select(RoleAssignment).where(
+                RoleAssignment.group_id == group_id,
+                RoleAssignment.project_id == project_id,
+                RoleAssignment.role_id == role_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        session.add(
+            RoleAssignment(group_id=group_id, project_id=project_id, role_id=role_id)
+        )
+        await session.commit()
+    return Response(status_code=204)
+
+
+@router.delete(
+    "/v3/projects/{project_id}/groups/{group_id}/roles/{role_id}", status_code=204
+)
+async def revoke_group_role(
+    project_id: str,
+    group_id: str,
+    role_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    assignment = (
+        await session.execute(
+            select(RoleAssignment).where(
+                RoleAssignment.group_id == group_id,
+                RoleAssignment.project_id == project_id,
+                RoleAssignment.role_id == role_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if assignment is None:
+        raise fault(SERVICE, 404, "Could not find role assignment.")
+    await session.delete(assignment)
+    await session.commit()
+    return Response(status_code=204)
+
+
+# --------------------------------------------------------------------------------------
+# Application credentials
+# --------------------------------------------------------------------------------------
+
+
+def app_credential_dict(
+    credential: ApplicationCredential, secret: str | None = None
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "id": credential.id,
+        "name": credential.name,
+        "user_id": credential.user_id,
+        "project_id": credential.project_id,
+        "description": credential.description,
+        "unrestricted": credential.unrestricted,
+        "roles": list(credential.roles or []),
+        "expires_at": iso(credential.expires_at),
+        "links": {
+            "self": service_url(
+                SERVICE,
+                f"/v3/users/{credential.user_id}/application_credentials/{credential.id}",
+            )
+        },
+    }
+    # Returned once, at creation. Keystone cannot show it again because it does not
+    # keep it in a readable form, and a simulator that showed it would teach the wrong
+    # habit to anything written against it.
+    if secret is not None:
+        body["secret"] = secret
+    return body
+
+
+@router.get("/v3/users/{user_id}/application_credentials")
+async def list_app_credentials(
+    user_id: str,
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    stmt = select(ApplicationCredential).where(ApplicationCredential.user_id == user_id)
+    if "name" in request.query_params:
+        stmt = stmt.where(ApplicationCredential.name == request.query_params["name"])
+    rows = (await session.execute(stmt.order_by(ApplicationCredential.created_at))).scalars()
+    return {"application_credentials": [app_credential_dict(c) for c in rows]}
+
+
+@router.post("/v3/users/{user_id}/application_credentials", status_code=201)
+async def create_app_credential(
+    user_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    user = await session.get(User, user_id)
+    if user is None:
+        raise fault(SERVICE, 404, f"Could not find user: {user_id}")
+    payload = (body or {}).get("application_credential") or {}
+    name = payload.get("name")
+    if not name:
+        raise fault(SERVICE, 400, "An application credential requires a name.")
+    clash = (
+        await session.execute(
+            select(ApplicationCredential).where(
+                ApplicationCredential.user_id == user_id,
+                ApplicationCredential.name == name,
+            )
+        )
+    ).scalar_one_or_none()
+    if clash is not None:
+        raise fault(
+            SERVICE,
+            409,
+            f"Conflict occurred attempting to store application credential: {name}",
+        )
+
+    expires_at = None
+    if payload.get("expires_at"):
+        try:
+            expires_at = datetime.fromisoformat(
+                str(payload["expires_at"]).replace("Z", "+00:00")
+            ).replace(tzinfo=None)
+        except ValueError:
+            raise fault(SERVICE, 400, f"Invalid expires_at: {payload['expires_at']!r}")
+
+    secret = payload.get("secret") or gen_token()
+    credential = ApplicationCredential(
+        id=gen_id(),
+        name=name,
+        user_id=user_id,
+        project_id=auth.project_id,
+        secret=secret,
+        description=payload.get("description", ""),
+        unrestricted=bool(payload.get("unrestricted", False)),
+        roles=payload.get("roles") or [{"name": "member"}],
+        expires_at=expires_at,
+    )
+    session.add(credential)
+    await session.commit()
+    return {"application_credential": app_credential_dict(credential, secret=secret)}
+
+
+@router.get("/v3/users/{user_id}/application_credentials/{credential_id}")
+async def get_app_credential(
+    user_id: str,
+    credential_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    credential = await session.get(ApplicationCredential, credential_id)
+    if credential is None or credential.user_id != user_id:
+        raise fault(
+            SERVICE, 404, f"Could not find application credential: {credential_id}"
+        )
+    return {"application_credential": app_credential_dict(credential)}
+
+
+@router.delete(
+    "/v3/users/{user_id}/application_credentials/{credential_id}", status_code=204
+)
+async def delete_app_credential(
+    user_id: str,
+    credential_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    credential = await session.get(ApplicationCredential, credential_id)
+    if credential is None or credential.user_id != user_id:
+        raise fault(
+            SERVICE, 404, f"Could not find application credential: {credential_id}"
+        )
+    await session.delete(credential)
+    await session.commit()
+    return Response(status_code=204)

@@ -12,7 +12,10 @@ from app.models.compute import (
 )
 from app.models.failure import VALID_ACTIONS, VALID_SERVICES, FailureInjection
 from app.models.identity import (
+    ApplicationCredential,
     Endpoint,
+    Group,
+    GroupMembership,
     Project,
     Role,
     RoleAssignment,
@@ -63,6 +66,7 @@ __all__ = [
     "VALID_ACTIONS",
     "UNLIMITED",
     "VALID_SERVICES",
+    "ApplicationCredential",
     "Backup",
     "Container",
     "Endpoint",
@@ -70,6 +74,8 @@ __all__ = [
     "Flavor",
     "FloatingIP",
     "HealthMonitor",
+    "Group",
+    "GroupMembership",
     "Hypervisor",
     "Image",
     "ImageMember",

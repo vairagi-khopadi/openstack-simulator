@@ -58,20 +58,92 @@ class Role(Base):
 
 
 class RoleAssignment(Base):
-    """user -> project -> role tuple, the scope check backing token issuance."""
+    """A role granted on a project, to either a user or a group.
+
+    Exactly one of ``user_id`` and ``group_id`` is set. A group assignment reaches every
+    member without being copied onto them, which is the point: adding a user to the group
+    grants the role, and removing them takes it away again.
+    """
 
     __tablename__ = "role_assignments"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    group_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
     project_id: Mapped[str] = mapped_column(
         ForeignKey("projects.id", ondelete="CASCADE"), index=True
     )
     role_id: Mapped[str] = mapped_column(ForeignKey("roles.id", ondelete="CASCADE"))
 
     __table_args__ = (
-        UniqueConstraint("user_id", "project_id", "role_id", name="uq_assignment"),
+        UniqueConstraint(
+            "user_id", "group_id", "project_id", "role_id", name="uq_assignment"
+        ),
     )
+
+
+class Group(Base):
+    """A set of users that role assignments can be made against.
+
+    Assigning to a group rather than a user is how an operator avoids re-granting the
+    same roles to every new joiner, so the useful half is that membership *implies* the
+    group's roles without copying them onto the user.
+    """
+
+    __tablename__ = "groups"
+    __table_args__ = (
+        UniqueConstraint("name", "domain_id", name="uq_group_name_domain"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_id)
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    domain_id: Mapped[str] = mapped_column(String(64), default=DOMAIN_ID)
+    description: Mapped[str] = mapped_column(String(1024), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+
+
+class GroupMembership(Base):
+    """One user's membership of one group."""
+
+    __tablename__ = "group_memberships"
+    __table_args__ = (
+        UniqueConstraint("group_id", "user_id", name="uq_group_member"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_id)
+    group_id: Mapped[str] = mapped_column(
+        ForeignKey("groups.id", ondelete="CASCADE"), index=True
+    )
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+
+
+class ApplicationCredential(Base):
+    """A long-lived credential scoped to one project, for automation.
+
+    The secret is shown once, at creation, and is not recoverable afterwards -- which is
+    the property that makes it safe to put in CI instead of a password.
+    """
+
+    __tablename__ = "application_credentials"
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_app_cred_name"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_id)
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    project_id: Mapped[str] = mapped_column(String(64), index=True)
+    secret: Mapped[str] = mapped_column(String(128))
+    description: Mapped[str] = mapped_column(String(1024), default="")
+    # A credential that cannot delegate cannot be used to mint another one, which is
+    # what keeps a leaked CI credential from escalating into a permanent foothold.
+    unrestricted: Mapped[bool] = mapped_column(Boolean, default=False)
+    roles: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
 
 
 class Token(Base):

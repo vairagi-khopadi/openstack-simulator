@@ -63,12 +63,16 @@ Still open here:
 
 ### Keystone
 
-Groups and group role assignments · application credentials · `/v3/credentials` · trusts
-(OS-TRUST) · EC2 credentials · federation · system-scoped tokens · password change
-(`POST /v3/users/{id}/password`) · project tags · project hierarchy (`parent_id`).
+**done** — Groups (CRUD, membership, the `HEAD`/`GET` membership check) and group role
+assignments, which resolve through membership at token issuance rather than being copied
+onto users. Application credentials, with the secret returned only at creation.
 
-CRUD is read-only for services, endpoints, domains and regions. Role assignment has `PUT`
-but no revoke, no `HEAD` check, no domain- or group-scoped assignments.
+Still open: `/v3/credentials` · trusts (OS-TRUST) · EC2 credentials · federation ·
+system-scoped tokens · password change (`POST /v3/users/{id}/password`) · project tags ·
+project hierarchy (`parent_id`).
+
+CRUD is still read-only for services, endpoints, domains and regions, and user role
+assignments have `PUT` but no revoke.
 
 ### Nova
 

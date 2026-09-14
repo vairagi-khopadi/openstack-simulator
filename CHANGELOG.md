@@ -23,6 +23,12 @@ Two numbers move independently:
   `trusted_image_certificates` (2.63) and `server_groups` (2.71), embeds the flavor only
   from 2.47, and `os-quota-sets` drops the network quotas at 2.36 and the personality-file
   quotas at 2.57.
+- **Keystone groups** (`/v3/groups`, membership, and
+  `/v3/projects/{p}/groups/{g}/roles/{r}`): a role granted to a group is resolved through
+  membership when a token is issued rather than copied onto each user, so joining grants
+  it and leaving takes it away. Plus **application credentials**
+  (`/v3/users/{id}/application_credentials`), whose secret is returned at creation and
+  never again.
 - **Cinder volume and snapshot metadata** (`PUT` replaces, `POST` merges, plus per-key
   `GET`/`PUT`/`DELETE`), **volume transfers** (`/v3/volume-transfers` and the legacy
   `/v3/os-volume-transfer`) with the auth key that makes them safe — shown once at
