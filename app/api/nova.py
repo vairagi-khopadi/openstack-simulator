@@ -28,7 +28,7 @@ from app.core.database import get_session
 from app.core.microversion import at_least
 from app.core.pagination import collection_links, page_request, paginate
 from app.core.middleware import AuthContext, OSPayload, fault, require
-from app.models.compute import Flavor, Keypair, Server
+from app.models.compute import Flavor, Keypair, Server, ServerGroup
 from app.models.network import Network, Port, SecurityGroup
 from app.models.storage import Image, Volume, VolumeAttachment
 from app.services import quotas, telemetry
@@ -261,7 +261,7 @@ def server_dict(
         ("2.19", "description", None),
         ("2.26", "tags", list(server.tags or [])),
         ("2.63", "trusted_image_certificates", None),
-        ("2.71", "server_groups", []),
+        ("2.71", "server_groups", [server.server_group_id] if server.server_group_id else []),
     ):
         if request is None or at_least(request, since):
             body[key] = value
@@ -576,6 +576,28 @@ async def create_server(
     elif not payload.block_device_mapping_v2:
         raise fault(SERVICE, 400, "Missing imageRef attribute.")
 
+    # -- scheduler hints ---------------------------------------------------------------
+    # The hints ride alongside "server" in the body, not inside it, under either of two
+    # spellings depending on how old the client is.
+    hints = body.get("os:scheduler_hints") or body.get("OS-SCHEDULER-HINTS:scheduler_hints") or {}
+    group_id = hints.get("group")
+    server_group: ServerGroup | None = None
+    if group_id:
+        server_group = await session.get(ServerGroup, group_id)
+        if server_group is None or server_group.deleted:
+            raise fault(SERVICE, 400, f"Invalid input: Server group {group_id} not found.")
+        if server_group.policy in ("anti-affinity", "affinity"):
+            members = await _group_members(session, server_group.id)
+            # One node means anti-affinity has nowhere to put a second member. A real
+            # multi-host cloud raises exactly this once every host already holds one.
+            if server_group.policy == "anti-affinity" and members:
+                raise fault(
+                    SERVICE,
+                    409,
+                    f"Unable to schedule: anti-affinity group {server_group.id} already "
+                    f"has an instance on {settings.host_name}, and it is the only host.",
+                )
+
     # -- quota, then depletion ---------------------------------------------------------
     # The project's own limit is checked first, so an admin who set --instances 2 is told
     # they hit their limit rather than being told a 256 GB node is full.
@@ -603,6 +625,7 @@ async def create_server(
         flavor_id=flavor.id,
         image_id=image.id if image else None,
         key_name=payload.key_name,
+        server_group_id=server_group.id if server_group else None,
         host=host.hostname,
         availability_zone=payload.availability_zone or "nova",
         status="BUILD",
@@ -1743,3 +1766,145 @@ async def tenant_usage(
             }
         ]
     }
+
+
+# --------------------------------------------------------------------------------------
+# Server groups
+# --------------------------------------------------------------------------------------
+
+# 2.64 replaced the "policies" list and "metadata" dict with a single "policy" plus
+# "rules"; before it, a group reported a one-element list.
+VALID_POLICIES = ("anti-affinity", "affinity", "soft-anti-affinity", "soft-affinity")
+
+
+async def _group_members(session: AsyncSession, group_id: str) -> list[str]:
+    return list(
+        (
+            await session.execute(
+                select(Server.id).where(
+                    Server.server_group_id == group_id, Server.deleted.is_(False)
+                )
+            )
+        ).scalars().all()
+    )
+
+
+def server_group_dict(
+    group: ServerGroup, members: list[str], request: Request | None = None
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "id": group.id,
+        "name": group.name,
+        "members": members,
+        "project_id": group.project_id,
+        "user_id": group.user_id,
+    }
+    if request is None or at_least(request, "2.64"):
+        body["policy"] = group.policy
+        body["rules"] = dict(group.rules or {})
+    else:
+        body["policies"] = [group.policy]
+        body["metadata"] = {}
+    return body
+
+
+async def _get_group(session: AsyncSession, group_id: str) -> ServerGroup:
+    group = await session.get(ServerGroup, group_id)
+    if group is None or group.deleted:
+        raise fault(SERVICE, 404, f"Server group {group_id} could not be found.")
+    return group
+
+
+@router.get("/v2.1/os-server-groups")
+async def list_server_groups(
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    stmt = select(ServerGroup).where(ServerGroup.deleted.is_(False))
+    if request.query_params.get("all_projects") not in ("1", "True", "true"):
+        stmt = stmt.where(ServerGroup.project_id == auth.project_id)
+    page = page_request(request.query_params, SERVICE)
+    stmt = await paginate(
+        session, stmt, ServerGroup, page, sort_column=ServerGroup.created_at
+    )
+    groups = list((await session.execute(stmt)).scalars().all())
+    return {
+        "server_groups": [
+            server_group_dict(g, await _group_members(session, g.id), request)
+            for g in groups
+        ]
+    }
+
+
+@router.post("/v2.1/os-server-groups", status_code=200)
+async def create_server_group(
+    body: dict[str, Any],
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    payload = body.get("server_group") or {}
+    name = payload.get("name")
+    if not name:
+        raise fault(SERVICE, 400, "Invalid input for field 'name': it is required.")
+
+    # 2.64 takes "policy"; older microversions take a one-element "policies" list.
+    if at_least(request, "2.64"):
+        policy = payload.get("policy")
+    else:
+        policies = payload.get("policies") or []
+        policy = policies[0] if policies else None
+    if policy not in VALID_POLICIES:
+        raise fault(
+            SERVICE,
+            400,
+            f"Invalid input for field 'policy': {policy!r} is not one of "
+            f"{list(VALID_POLICIES)}.",
+        )
+
+    try:
+        await quotas.enforce(session, SERVICE, auth.project_id, "server_groups")
+    except quotas.QuotaError as exc:
+        raise fault(SERVICE, 403, str(exc))
+
+    group = ServerGroup(
+        id=gen_id(),
+        name=name,
+        project_id=auth.project_id,
+        user_id=auth.user_id,
+        policy=policy,
+        rules=payload.get("rules") or {},
+    )
+    session.add(group)
+    await session.commit()
+    return {"server_group": server_group_dict(group, [], request)}
+
+
+@router.get("/v2.1/os-server-groups/{group_id}")
+async def get_server_group(
+    group_id: str,
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    group = await _get_group(session, group_id)
+    members = await _group_members(session, group.id)
+    return {"server_group": server_group_dict(group, members, request)}
+
+
+@router.delete("/v2.1/os-server-groups/{group_id}", status_code=204)
+async def delete_server_group(
+    group_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    group = await _get_group(session, group_id)
+    group.deleted = True
+    # Members outlive the group on a real cloud; they simply stop being constrained.
+    for server_id in await _group_members(session, group.id):
+        server = await session.get(Server, server_id)
+        if server is not None:
+            server.server_group_id = None
+    await session.commit()
+    return Response(status_code=204)

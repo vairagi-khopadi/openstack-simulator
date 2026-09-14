@@ -23,6 +23,12 @@ Two numbers move independently:
   `trusted_image_certificates` (2.63) and `server_groups` (2.71), embeds the flavor only
   from 2.47, and `os-quota-sets` drops the network quotas at 2.36 and the personality-file
   quotas at 2.57.
+- **Nova server groups** (`/v2.1/os-server-groups`): CRUD, the `group` scheduler hint on
+  boot (both header spellings), membership reported on the server body from 2.71, and the
+  2.64 switch from `policies`/`metadata` to `policy`/`rules`. Anti-affinity refuses a
+  second member with a `409` — one node means there is nowhere else to place it, which is
+  the error a real multi-host cloud gives once every host holds one. Soft policies degrade
+  rather than fail.
 - **Cinder backups** (`/v3/backups`): create, list, detail, show, update, delete,
   restore into a new or existing volume, and the `os-reset_status` / `os-force_delete`
   actions. Incremental backups chain onto the last available full backup, and a parent

@@ -69,7 +69,12 @@ but no revoke, no `HEAD` check, no domain- or group-scoped assignments.
 
 ### Nova
 
-Server groups (anti-affinity) · host aggregates · migrations (`/os-migrations`,
+**done** — Server groups: CRUD, the `group` scheduler hint at boot, membership on the
+server body from 2.71, and the 2.64 change from `policies`/`metadata` to `policy`/`rules`.
+Anti-affinity refuses a second member, since one node means there is nowhere else to put
+it; soft policies degrade instead.
+
+Still open: host aggregates · migrations (`/os-migrations`,
 `/servers/{id}/migrations`) · instance actions (`/servers/{id}/os-instance-actions`) ·
 remote consoles (`/servers/{id}/remote-consoles` — note `os-getConsoleOutput` *is*
 supported as a server action) · server tags · interface attach/detach (only `GET

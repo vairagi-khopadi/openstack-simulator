@@ -20,7 +20,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import gen_id, now_utc, settings
-from app.models.compute import Server
+from app.models.compute import Server, ServerGroup
 from app.models.network import (
     FloatingIP,
     Network,
@@ -231,6 +231,7 @@ _COUNTERS: dict[str, dict[str, Counter]] = {
         "instances": Counter(Server),
         "cores": Counter(Server, Server.allocated_vcpus),
         "ram": Counter(Server, Server.allocated_ram_mb),
+        "server_groups": Counter(ServerGroup),
     },
     "cinder": {
         "volumes": Counter(Volume),

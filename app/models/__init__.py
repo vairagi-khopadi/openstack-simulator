@@ -8,6 +8,7 @@ from app.models.compute import (
     Hypervisor,
     Keypair,
     Server,
+    ServerGroup,
 )
 from app.models.failure import VALID_ACTIONS, VALID_SERVICES, FailureInjection
 from app.models.identity import (
@@ -79,6 +80,7 @@ __all__ = [
     "SecurityGroup",
     "SecurityGroupRule",
     "Server",
+    "ServerGroup",
     "Service",
     "Snapshot",
     "Subnet",

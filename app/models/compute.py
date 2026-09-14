@@ -91,6 +91,28 @@ class Keypair(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
 
 
+class ServerGroup(Base):
+    """An affinity or anti-affinity group.
+
+    On a real cloud the policy is advice to the scheduler: ``anti-affinity`` keeps members
+    on different hosts. There is exactly one host here, so the interesting half is the
+    *refusal* -- a second anti-affinity member has nowhere else to go, which is the error
+    a multi-node deployment would only produce once it ran out of hosts.
+    """
+
+    __tablename__ = "server_groups"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_id)
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    project_id: Mapped[str] = mapped_column(String(64), index=True)
+    user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    policy: Mapped[str] = mapped_column(String(32), default="anti-affinity")
+    rules: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    deleted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+
+
 class Server(Base):
     """A simulated instance. No QEMU is launched -- only the allocation is booked."""
 
@@ -104,6 +126,9 @@ class Server(Base):
     flavor_id: Mapped[str] = mapped_column(ForeignKey("flavors.id"))
     image_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     key_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Set from the group_id scheduler hint at boot; membership is the instance's, so a
+    # deleted instance leaves the group automatically.
+    server_group_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     host: Mapped[str] = mapped_column(String(255), index=True)
     availability_zone: Mapped[str] = mapped_column(String(64), default="nova")
 
