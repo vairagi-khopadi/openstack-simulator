@@ -22,6 +22,8 @@ from app.models.identity import (
 )
 from app.models.loadbalancer import (
     HealthMonitor,
+    L7Policy,
+    L7Rule,
     Listener,
     LoadBalancer,
     Member,
@@ -68,6 +70,8 @@ __all__ = [
     "Image",
     "ImageMember",
     "Keypair",
+    "L7Policy",
+    "L7Rule",
     "Listener",
     "LoadBalancer",
     "Member",

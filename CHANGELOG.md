@@ -23,6 +23,13 @@ Two numbers move independently:
   `trusted_image_certificates` (2.63) and `server_groups` (2.71), embeds the flavor only
   from 2.47, and `os-quota-sets` drops the network quotas at 2.36 and the personality-file
   quotas at 2.57.
+- **Octavia L7 policies and rules** (`/v2/lbaas/l7policies`, `/rules`): full CRUD, the
+  per-action validation Octavia does (`REDIRECT_TO_POOL` needs a pool, `REDIRECT_TO_URL`
+  a url, `HEADER`/`COOKIE`/`SSL_DN_FIELD` rules a key), and position renumbering across a
+  listener's policies on every create and delete. Plus **statistics**
+  (`/loadbalancers/{id}/stats`, `/listeners/{id}/stats`) — synthetic but deterministic per
+  resource, so a polling dashboard sees stable numbers — and **health-monitor update**,
+  which refuses a timeout longer than the delay between probes.
 - **Glance image import** (`/v2/images/{id}/stage`, `/import`, `/v2/info/import`,
   `/v2/info/stores`) for both `glance-direct` and `web-download`, reaching `active`
   through a **task** (`/v2/tasks`) rather than immediately — the polling loop the direct

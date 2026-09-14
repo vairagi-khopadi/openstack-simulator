@@ -8,6 +8,7 @@ The router carries relative paths so ``main.py`` can mount it at both ``/v2/lbaa
 """
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -19,7 +20,15 @@ from app.core.config import gen_id, iso, now_utc, settle_transition, transition_
 from app.core.database import get_session
 from app.core.pagination import collection_links, page_request, paginate
 from app.core.middleware import AuthContext, OSPayload, body_object, fault, require
-from app.models.loadbalancer import HealthMonitor, Listener, LoadBalancer, Member, Pool
+from app.models.loadbalancer import (
+    HealthMonitor,
+    L7Policy,
+    L7Rule,
+    Listener,
+    LoadBalancer,
+    Member,
+    Pool,
+)
 from app.models.network import Network, Subnet
 from app.services.networking import AddressPoolExhausted, create_port_record
 
@@ -959,6 +968,37 @@ async def get_health_monitor(
     return {"healthmonitor": monitor_dict(monitor)}
 
 
+@router.put("/healthmonitors/{monitor_id}")
+async def update_health_monitor(
+    monitor_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Retune a monitor in place -- the usual reason is a backend that needs longer."""
+    monitor = await session.get(HealthMonitor, monitor_id)
+    if monitor is None or monitor.deleted:
+        raise fault(SERVICE, 404, f"Health Monitor {monitor_id} not found.")
+    resolve(monitor)
+    payload = body.get("healthmonitor") or {}
+    for field in ("name", "delay", "timeout", "max_retries", "max_retries_down",
+                  "http_method", "url_path", "expected_codes", "admin_state_up", "tags"):
+        if field in payload:
+            setattr(monitor, field, payload[field])
+    # Octavia refuses a timeout longer than the interval between probes: the next check
+    # would start before the previous one gave up.
+    if monitor.timeout > monitor.delay:
+        raise fault(
+            SERVICE,
+            400,
+            f"Invalid input: timeout ({monitor.timeout}) must not be larger than "
+            f"delay ({monitor.delay}).",
+        )
+    monitor.updated_at = now_utc()
+    await session.commit()
+    return {"healthmonitor": monitor_dict(monitor)}
+
+
 @router.delete("/healthmonitors/{monitor_id}", status_code=204)
 async def delete_health_monitor(
     monitor_id: str,
@@ -995,3 +1035,430 @@ async def list_providers(auth: AuthContext = auth_dep) -> dict[str, Any]:
 @router.get("/flavors")
 async def list_flavors(auth: AuthContext = auth_dep) -> dict[str, Any]:
     return {"flavors": []}
+
+
+# --------------------------------------------------------------------------------------
+# L7 policies and rules
+# --------------------------------------------------------------------------------------
+
+L7_ACTIONS = ("REJECT", "REDIRECT_TO_POOL", "REDIRECT_TO_URL", "REDIRECT_PREFIX")
+L7_RULE_TYPES = (
+    "HOST_NAME", "PATH", "FILE_TYPE", "HEADER", "COOKIE", "SSL_CONN_HAS_CERT",
+    "SSL_VERIFY_RESULT", "SSL_DN_FIELD",
+)
+L7_COMPARE_TYPES = ("REGEX", "STARTS_WITH", "ENDS_WITH", "CONTAINS", "EQUAL_TO")
+# These carry a key as well as a value -- "the Cookie named X equals Y".
+L7_KEYED_TYPES = ("HEADER", "COOKIE", "SSL_DN_FIELD")
+
+
+class L7PolicyPayload(OSPayload):
+    listener_id: str
+    name: str = ""
+    description: str = ""
+    action: str = "REJECT"
+    redirect_pool_id: str | None = None
+    redirect_url: str | None = None
+    redirect_prefix: str | None = None
+    redirect_http_code: int | None = None
+    position: int | None = None
+    admin_state_up: bool = True
+    tags: list[str] = Field(default_factory=list)
+
+
+class L7RulePayload(OSPayload):
+    type: str
+    compare_type: str
+    value: str
+    key: str | None = None
+    invert: bool = False
+    admin_state_up: bool = True
+    tags: list[str] = Field(default_factory=list)
+
+
+def l7policy_dict(policy: L7Policy, rules: list[str]) -> dict[str, Any]:
+    return {
+        "id": policy.id,
+        "name": policy.name,
+        "description": policy.description,
+        "project_id": policy.project_id,
+        "listener_id": policy.listener_id,
+        "action": policy.action,
+        "redirect_pool_id": policy.redirect_pool_id,
+        "redirect_url": policy.redirect_url,
+        "redirect_prefix": policy.redirect_prefix,
+        "redirect_http_code": policy.redirect_http_code,
+        "position": policy.position,
+        "provisioning_status": policy.provisioning_status,
+        "operating_status": policy.operating_status,
+        "admin_state_up": policy.admin_state_up,
+        "rules": [{"id": rule_id} for rule_id in rules],
+        "tags": list(policy.tags or []),
+        "created_at": iso(policy.created_at),
+        "updated_at": iso(policy.updated_at),
+    }
+
+
+def l7rule_dict(rule: L7Rule) -> dict[str, Any]:
+    return {
+        "id": rule.id,
+        "project_id": rule.project_id,
+        "type": rule.type,
+        "compare_type": rule.compare_type,
+        "key": rule.key,
+        "value": rule.value,
+        "invert": rule.invert,
+        "provisioning_status": rule.provisioning_status,
+        "operating_status": rule.operating_status,
+        "admin_state_up": rule.admin_state_up,
+        "tags": list(rule.tags or []),
+        "created_at": iso(rule.created_at),
+        "updated_at": iso(rule.updated_at),
+    }
+
+
+async def _get_listener(session: AsyncSession, listener_id: str) -> Listener:
+    listener = await session.get(Listener, listener_id)
+    if listener is None or listener.deleted:
+        raise fault(SERVICE, 404, f"Listener {listener_id} not found.")
+    return resolve(listener)
+
+
+async def _get_policy(session: AsyncSession, policy_id: str) -> L7Policy:
+    policy = await session.get(L7Policy, policy_id)
+    if policy is None or policy.deleted:
+        raise fault(SERVICE, 404, f"L7Policy {policy_id} not found.")
+    return resolve(policy)
+
+
+async def _get_rule(session: AsyncSession, policy_id: str, rule_id: str) -> L7Rule:
+    rule = await session.get(L7Rule, rule_id)
+    if rule is None or rule.deleted or rule.l7policy_id != policy_id:
+        raise fault(SERVICE, 404, f"L7Rule {rule_id} not found.")
+    return resolve(rule)
+
+
+async def _policy_rules(session: AsyncSession, policy_id: str) -> list[str]:
+    return list(
+        (
+            await session.execute(
+                select(L7Rule.id).where(
+                    L7Rule.l7policy_id == policy_id, L7Rule.deleted.is_(False)
+                )
+            )
+        ).scalars().all()
+    )
+
+
+async def _renumber(session: AsyncSession, listener_id: str) -> None:
+    """Close the gaps in a listener's policy positions, as Octavia does on every change."""
+    policies = (
+        await session.execute(
+            select(L7Policy)
+            .where(L7Policy.listener_id == listener_id, L7Policy.deleted.is_(False))
+            .order_by(L7Policy.position, L7Policy.created_at)
+        )
+    ).scalars().all()
+    for index, policy in enumerate(policies, start=1):
+        policy.position = index
+
+
+def _validate_policy_action(payload: L7PolicyPayload) -> None:
+    """Each action needs its own companion field, and Octavia refuses without it."""
+    if payload.action not in L7_ACTIONS:
+        raise fault(
+            SERVICE, 400,
+            f"Invalid input for action: {payload.action!r} must be one of {list(L7_ACTIONS)}.",
+        )
+    required = {
+        "REDIRECT_TO_POOL": ("redirect_pool_id", payload.redirect_pool_id),
+        "REDIRECT_TO_URL": ("redirect_url", payload.redirect_url),
+        "REDIRECT_PREFIX": ("redirect_prefix", payload.redirect_prefix),
+    }.get(payload.action)
+    if required and not required[1]:
+        raise fault(
+            SERVICE, 400,
+            f"Invalid input: action {payload.action} requires {required[0]}.",
+        )
+
+
+@router.get("/l7policies")
+async def list_l7policies(
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    stmt = select(L7Policy).where(L7Policy.deleted.is_(False))
+    if "listener_id" in request.query_params:
+        stmt = stmt.where(L7Policy.listener_id == request.query_params["listener_id"])
+    page = page_request(request.query_params, SERVICE)
+    stmt = await paginate(
+        session, stmt, L7Policy, page, sort_column=L7Policy.created_at, descending=False
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
+    for row in rows:
+        resolve(row)
+    await session.commit()
+    return {
+        "l7policies": [
+            l7policy_dict(p, await _policy_rules(session, p.id)) for p in rows
+        ],
+        **collection_links(request, "l7policies", rows, page),
+    }
+
+
+@router.post("/l7policies", status_code=201)
+async def create_l7policy(
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    payload = L7PolicyPayload(**(body.get("l7policy") or {}))
+    listener = await _get_listener(session, payload.listener_id)
+    _validate_policy_action(payload)
+    if payload.action == "REDIRECT_TO_POOL":
+        pool = await session.get(Pool, payload.redirect_pool_id)
+        if pool is None or pool.deleted:
+            raise fault(SERVICE, 404, f"Pool {payload.redirect_pool_id} not found.")
+
+    existing = len(
+        (
+            await session.execute(
+                select(L7Policy.id).where(
+                    L7Policy.listener_id == listener.id, L7Policy.deleted.is_(False)
+                )
+            )
+        ).scalars().all()
+    )
+    policy = L7Policy(
+        id=gen_id(),
+        name=payload.name,
+        description=payload.description,
+        project_id=auth.project_id,
+        listener_id=listener.id,
+        action=payload.action,
+        redirect_pool_id=payload.redirect_pool_id,
+        redirect_url=payload.redirect_url,
+        redirect_prefix=payload.redirect_prefix,
+        redirect_http_code=payload.redirect_http_code
+        or (302 if payload.action.startswith("REDIRECT") else None),
+        position=min(payload.position or existing + 1, existing + 1),
+        admin_state_up=payload.admin_state_up,
+        tags=payload.tags,
+        **_pending(),
+    )
+    session.add(policy)
+    await session.flush()
+    await _renumber(session, listener.id)
+    await session.commit()
+    return {"l7policy": l7policy_dict(policy, [])}
+
+
+@router.get("/l7policies/{policy_id}")
+async def get_l7policy(
+    policy_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    policy = await _get_policy(session, policy_id)
+    rules = await _policy_rules(session, policy.id)
+    await session.commit()
+    return {"l7policy": l7policy_dict(policy, rules)}
+
+
+@router.put("/l7policies/{policy_id}")
+async def update_l7policy(
+    policy_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    policy = await _get_policy(session, policy_id)
+    payload = body.get("l7policy") or {}
+    for field in ("name", "description", "redirect_url", "redirect_prefix",
+                  "redirect_pool_id", "redirect_http_code", "admin_state_up", "tags"):
+        if field in payload:
+            setattr(policy, field, payload[field])
+    if "action" in payload:
+        if payload["action"] not in L7_ACTIONS:
+            raise fault(SERVICE, 400, f"Invalid input for action: {payload['action']!r}.")
+        policy.action = payload["action"]
+    if "position" in payload:
+        policy.position = payload["position"]
+        await _renumber(session, policy.listener_id)
+    policy.updated_at = now_utc()
+    await session.commit()
+    rules = await _policy_rules(session, policy.id)
+    return {"l7policy": l7policy_dict(policy, rules)}
+
+
+@router.delete("/l7policies/{policy_id}", status_code=204)
+async def delete_l7policy(
+    policy_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    policy = await _get_policy(session, policy_id)
+    policy.deleted = True
+    for rule_id in await _policy_rules(session, policy.id):
+        rule = await session.get(L7Rule, rule_id)
+        if rule is not None:
+            rule.deleted = True
+    await session.flush()
+    await _renumber(session, policy.listener_id)
+    await session.commit()
+    return Response(status_code=204)
+
+
+@router.get("/l7policies/{policy_id}/rules")
+async def list_l7rules(
+    policy_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    await _get_policy(session, policy_id)
+    rows = (
+        await session.execute(
+            select(L7Rule)
+            .where(L7Rule.l7policy_id == policy_id, L7Rule.deleted.is_(False))
+            .order_by(L7Rule.created_at)
+        )
+    ).scalars().all()
+    for row in rows:
+        resolve(row)
+    await session.commit()
+    return {"rules": [l7rule_dict(r) for r in rows]}
+
+
+@router.post("/l7policies/{policy_id}/rules", status_code=201)
+async def create_l7rule(
+    policy_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    policy = await _get_policy(session, policy_id)
+    payload = L7RulePayload(**(body.get("rule") or {}))
+    if payload.type not in L7_RULE_TYPES:
+        raise fault(
+            SERVICE, 400,
+            f"Invalid input for type: {payload.type!r} must be one of {list(L7_RULE_TYPES)}.",
+        )
+    if payload.compare_type not in L7_COMPARE_TYPES:
+        raise fault(
+            SERVICE, 400,
+            f"Invalid input for compare_type: {payload.compare_type!r} must be one of "
+            f"{list(L7_COMPARE_TYPES)}.",
+        )
+    # "the header named X contains Y" is meaningless without the name.
+    if payload.type in L7_KEYED_TYPES and not payload.key:
+        raise fault(
+            SERVICE, 400, f"Invalid input: a {payload.type} rule requires a key."
+        )
+
+    rule = L7Rule(
+        id=gen_id(),
+        project_id=auth.project_id,
+        l7policy_id=policy.id,
+        type=payload.type,
+        compare_type=payload.compare_type,
+        key=payload.key,
+        value=payload.value,
+        invert=payload.invert,
+        admin_state_up=payload.admin_state_up,
+        tags=payload.tags,
+        **_pending(),
+    )
+    session.add(rule)
+    await session.commit()
+    return {"rule": l7rule_dict(rule)}
+
+
+@router.get("/l7policies/{policy_id}/rules/{rule_id}")
+async def get_l7rule(
+    policy_id: str,
+    rule_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    rule = await _get_rule(session, policy_id, rule_id)
+    await session.commit()
+    return {"rule": l7rule_dict(rule)}
+
+
+@router.put("/l7policies/{policy_id}/rules/{rule_id}")
+async def update_l7rule(
+    policy_id: str,
+    rule_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    rule = await _get_rule(session, policy_id, rule_id)
+    payload = body.get("rule") or {}
+    for field in ("value", "key", "invert", "admin_state_up", "tags"):
+        if field in payload:
+            setattr(rule, field, payload[field])
+    if "compare_type" in payload:
+        if payload["compare_type"] not in L7_COMPARE_TYPES:
+            raise fault(SERVICE, 400, "Invalid input for compare_type.")
+        rule.compare_type = payload["compare_type"]
+    rule.updated_at = now_utc()
+    await session.commit()
+    return {"rule": l7rule_dict(rule)}
+
+
+@router.delete("/l7policies/{policy_id}/rules/{rule_id}", status_code=204)
+async def delete_l7rule(
+    policy_id: str,
+    rule_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    rule = await _get_rule(session, policy_id, rule_id)
+    rule.deleted = True
+    await session.commit()
+    return Response(status_code=204)
+
+
+# --------------------------------------------------------------------------------------
+# Statistics
+# --------------------------------------------------------------------------------------
+
+
+def _stats_for(resource_id: str, members: int = 0) -> dict[str, int]:
+    """Plausible counters derived from the id, not measurements.
+
+    Nothing proxies traffic here, so these cannot be real. They are deterministic per
+    resource so a dashboard polling them sees stable, non-jittering numbers rather than
+    figures that jump on every read.
+    """
+    seed = int(hashlib.sha256(resource_id.encode()).hexdigest()[:12], 16)
+    scale = max(members, 1)
+    return {
+        "active_connections": (seed % 97) * scale,
+        "bytes_in": (seed % 1_000_003) * 1024 * scale,
+        "bytes_out": (seed % 1_000_033) * 2048 * scale,
+        "request_errors": seed % 7,
+        "total_connections": (seed % 50_021) * scale,
+    }
+
+
+@router.get("/loadbalancers/{lb_id}/stats")
+async def loadbalancer_stats(
+    lb_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    lb = await _get_lb(session, lb_id)
+    listeners, _ = await _children(session, lb.id)
+    return {"stats": _stats_for(lb.id, len(listeners))}
+
+
+@router.get("/listeners/{listener_id}/stats")
+async def listener_stats(
+    listener_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    listener = await _get_listener(session, listener_id)
+    return {"stats": _stats_for(listener.id)}

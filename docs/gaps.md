@@ -124,9 +124,11 @@ trait writes, no aggregate writes, no `POST /reshaper`, no nested providers. Onl
 
 ### Octavia
 
-L7 policies and rules · statistics (`/loadbalancers/{id}/stats`, `/listeners/{id}/stats`)
-· amphorae · failover · quotas · flavor profiles · availability zones · health-monitor
-update · batch member update.
+**done** — L7 policies and rules (with position bookkeeping and per-action validation),
+load balancer and listener statistics, and health-monitor update.
+
+Still open: amphorae · failover · quotas (`/v2.0/lbaas/quotas`) · flavor profiles ·
+availability zones · batch member update.
 
 ### Swift
 
