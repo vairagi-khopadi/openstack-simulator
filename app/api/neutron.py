@@ -12,8 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import gen_id, iso_us, now_utc, settings
 from app.core.database import get_session
+from app.services import quotas as quota_service
 from app.core.pagination import collection_links, page_request, paginate
 from app.core.middleware import AuthContext, OSPayload, body_object, fault, require
+from app.models.quota import Quota
 from app.models.network import (
     FloatingIP,
     Network,
@@ -335,21 +337,87 @@ async def availability_zones(auth: AuthContext = auth_dep) -> dict[str, Any]:
     }
 
 
-@router.get("/v2.0/quotas/{project_id}")
-async def quotas(project_id: str, auth: AuthContext = auth_dep) -> dict[str, Any]:
+@router.get("/v2.0/quotas")
+async def list_quotas(
+    auth: AuthContext = auth_dep, session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    """Every project that has had a quota set on it. Untouched projects are not listed."""
+    rows = (await session.execute(select(Quota).where(Quota.service == SERVICE))).scalars()
+    projects = sorted({row.project_id for row in rows})
     return {
-        "quota": {
-            "floatingip": 50,
-            "network": 100,
-            "port": 500,
-            "rbac_policy": 10,
-            "router": 10,
-            "security_group": 100,
-            "security_group_rule": settings.host_conntrack_max,
-            "subnet": 100,
-            "subnetpool": -1,
-        }
+        "quotas": [
+            {**await quota_service.limits(session, SERVICE, project), "project_id": project,
+             "tenant_id": project}
+            for project in projects
+        ]
     }
+
+
+@router.get("/v2.0/quotas/{project_id}")
+async def show_quota(
+    project_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    return {"quota": await quota_service.limits(session, SERVICE, project_id)}
+
+
+@router.get("/v2.0/quotas/{project_id}/default")
+async def show_default_quota(
+    project_id: str, auth: AuthContext = auth_dep
+) -> dict[str, Any]:
+    return {"quota": dict(quota_service.NEUTRON_DEFAULTS)}
+
+
+@router.get("/v2.0/quotas/{project_id}/details")
+async def show_quota_details(
+    project_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Limits with usage, as ``openstack quota show --network`` reads them."""
+    return {"quota": await quota_service.detail(session, SERVICE, project_id)}
+
+
+@router.put("/v2.0/quotas/{project_id}")
+async def update_quota(
+    project_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Set this project's network limits, enforced on the next create."""
+    try:
+        values = quota_service.parse_limits(SERVICE, body.get("quota") or {})
+    except quota_service.InvalidLimit as exc:
+        raise fault(SERVICE, 400, exc.message)
+    effective = await quota_service.set_limits(session, SERVICE, project_id, values)
+    await session.commit()
+    return {"quota": effective}
+
+
+@router.delete("/v2.0/quotas/{project_id}", status_code=204)
+async def delete_quota(
+    project_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    await quota_service.clear_limits(session, SERVICE, project_id)
+    await session.commit()
+    return Response(status_code=204)
+
+
+async def _enforce(session: AsyncSession, project_id: str, resource: str) -> None:
+    """Neutron reports going over as a 409 OverQuota naming the resource."""
+    try:
+        await quota_service.enforce(session, SERVICE, project_id, resource)
+    except quota_service.QuotaError as exc:
+        raise fault(
+            SERVICE,
+            409,
+            f"Quota exceeded for resources: ['{exc.resource}'].",
+            type="OverQuota",
+        )
 
 
 # --------------------------------------------------------------------------------------
@@ -446,6 +514,8 @@ async def create_network(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     payload = NetworkPayload(**body_object(SERVICE, body, "network"))
+    await _enforce(session, payload.project_id or payload.tenant_id or auth.project_id,
+                   "network")
     network = Network(
         id=gen_id(),
         name=payload.name or f"net-{gen_id()[:8]}",
@@ -567,6 +637,7 @@ async def create_subnet(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     payload = SubnetPayload(**body_object(SERVICE, body, "subnet"))
+    await _enforce(session, auth.project_id, "subnet")
     network = await session.get(Network, payload.network_id)
     if network is None:
         raise fault(SERVICE, 404, f"Network {payload.network_id} could not be found.",
@@ -699,6 +770,7 @@ async def create_port(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     payload = PortPayload(**body_object(SERVICE, body, "port"))
+    await _enforce(session, auth.project_id, "port")
     network = await session.get(Network, payload.network_id)
     if network is None:
         raise fault(SERVICE, 404, f"Network {payload.network_id} could not be found.",
@@ -810,6 +882,7 @@ async def create_security_group(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     payload = SecurityGroupPayload(**body_object(SERVICE, body, "security_group"))
+    await _enforce(session, auth.project_id, "security_group")
     try:
         await check_conntrack_capacity(session, len(DEFAULT_EGRESS))
     except CapacityError as exc:
@@ -920,6 +993,7 @@ async def create_security_group_rule(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     payload = SecurityGroupRulePayload(**body_object(SERVICE, body, "security_group_rule"))
+    await _enforce(session, auth.project_id, "security_group_rule")
     group = await session.get(SecurityGroup, payload.security_group_id)
     if group is None:
         raise fault(
@@ -1019,6 +1093,7 @@ async def create_floating_ip(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     payload = FloatingIPPayload(**body_object(SERVICE, body, "floatingip"))
+    await _enforce(session, auth.project_id, "floatingip")
     network = await session.get(Network, payload.floating_network_id)
     if network is None:
         raise fault(
@@ -1284,6 +1359,7 @@ async def create_router(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     payload = RouterPayload(**body_object(SERVICE, body, "router"))
+    await _enforce(session, auth.project_id, "router")
     record = Router(
         id=gen_id(),
         name=payload.name or f"router-{gen_id()[:8]}",

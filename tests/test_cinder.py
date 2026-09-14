@@ -265,8 +265,10 @@ async def test_limits_quotas_and_pools(api, cloud) -> None:
     assert absolute["maxTotalVolumeGigabytes"] == 4096
     assert absolute["totalGigabytesUsed"] == 100
 
+    # The absolute limits above are the node's; the quota is the project's, and the
+    # seeded admin project has none -- so storage capacity is what binds for it.
     quota = (await api["cinder"].get(f"/v3/os-quota-sets/{cloud.project_id}")).json()["quota_set"]
-    assert quota["id"] == cloud.project_id and quota["gigabytes"] == 4096
+    assert quota["id"] == cloud.project_id and quota["gigabytes"] == -1
 
     pools = (await api["cinder"].get("/v3/scheduler-stats/get_pools")).json()["pools"]
     assert pools[0]["capabilities"]["allocated_capacity_gb"] == 100

@@ -31,7 +31,7 @@ from app.core.middleware import AuthContext, OSPayload, fault, require
 from app.models.compute import Flavor, Keypair, Server
 from app.models.network import Network, Port, SecurityGroup
 from app.models.storage import Image, Volume, VolumeAttachment
-from app.services import telemetry
+from app.services import quotas, telemetry
 from app.services.capacity import (
     CapacityError,
     check_instance_capacity,
@@ -576,7 +576,18 @@ async def create_server(
     elif not payload.block_device_mapping_v2:
         raise fault(SERVICE, 400, "Missing imageRef attribute.")
 
-    # -- depletion check ---------------------------------------------------------------
+    # -- quota, then depletion ---------------------------------------------------------
+    # The project's own limit is checked first, so an admin who set --instances 2 is told
+    # they hit their limit rather than being told a 256 GB node is full.
+    try:
+        await quotas.enforce_all(
+            session,
+            SERVICE,
+            auth.project_id,
+            {"instances": 1, "cores": flavor.vcpus, "ram": flavor.ram},
+        )
+    except quotas.QuotaError as exc:
+        raise fault(SERVICE, 403, str(exc))
     try:
         await check_instance_capacity(session, flavor.vcpus, flavor.ram, flavor.disk)
     except CapacityError as exc:
@@ -1532,6 +1543,47 @@ async def services(
     }
 
 
+def _legacy_quotas(request: Request, conntrack_max: int) -> dict[str, int]:
+    """Quotas Nova used to report and no longer does, for clients pinned before removal.
+
+    2.36 stopped proxying the network quotas from Neutron; 2.57 dropped the
+    personality-file quotas with the feature itself. Reporting them at a version that
+    removed them is how code ends up reading a key the real cloud will not send.
+    """
+    legacy: dict[str, int] = {}
+    if not at_least(request, "2.57"):
+        legacy |= {
+            "injected_files": 5,
+            "injected_file_content_bytes": 10240,
+            "injected_file_path_bytes": 255,
+        }
+    if not at_least(request, "2.36"):
+        legacy |= {
+            "fixed_ips": -1,
+            "floating_ips": 50,
+            "security_groups": 100,
+            "security_group_rules": conntrack_max,
+        }
+    return legacy
+
+
+async def _quota_body(
+    session: AsyncSession, request: Request, project_id: str, detail: bool
+) -> dict[str, Any]:
+    usage = await get_usage(session)
+    legacy = _legacy_quotas(request, usage.conntrack_max)
+    if detail:
+        body: dict[str, Any] = dict(await quotas.detail(session, SERVICE, project_id))
+        body |= {
+            key: {"limit": value, "in_use": 0, "reserved": 0}
+            for key, value in legacy.items()
+        }
+    else:
+        body = dict(await quotas.limits(session, SERVICE, project_id)) | legacy
+    body["id"] = project_id
+    return {"quota_set": body}
+
+
 @router.get("/v2.1/os-quota-sets/{project_id}")
 async def quota_set(
     project_id: str,
@@ -1540,46 +1592,65 @@ async def quota_set(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     """Compute quotas. `openstack quota show` reads this alongside Cinder and Neutron."""
+    # ?usage=true is the older spelling of the /detail route below; both are served.
+    detail = request.query_params.get("usage", "").lower() in ("true", "1")
+    return await _quota_body(session, request, project_id, detail)
+
+
+@router.get("/v2.1/os-quota-sets/{project_id}/detail")
+async def quota_set_detail(
+    project_id: str,
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Limits with usage against them -- what `openstack quota show --usage` calls."""
+    return await _quota_body(session, request, project_id, detail=True)
+
+
+@router.get("/v2.1/os-quota-sets/{project_id}/defaults")
+async def quota_set_defaults(
+    project_id: str,
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """The limits before any override -- `openstack quota list` diffs against these."""
     usage = await get_usage(session)
-    limits: dict[str, Any] = {
-        "cores": int(usage.vcpus_allocatable),
-        "ram": int(usage.ram_allocatable_mb),
-        "instances": -1,
-        "key_pairs": 100,
-        "metadata_items": 128,
-        "server_groups": 10,
-        "server_group_members": 10,
-    }
-    # Nova stopped proxying the network quotas at 2.36 and dropped the personality-file
-    # quotas with that feature at 2.57. Reporting them at a version that removed them is
-    # how code ends up reading a key the real cloud will not send.
-    if not at_least(request, "2.57"):
-        limits |= {
-            "injected_files": 5,
-            "injected_file_content_bytes": 10240,
-            "injected_file_path_bytes": 255,
-        }
-    if not at_least(request, "2.36"):
-        limits |= {
-            "fixed_ips": -1,
-            "floating_ips": 50,
-            "security_groups": 100,
-            "security_group_rules": usage.conntrack_max,
-        }
-    if request.query_params.get("usage", "").lower() in ("true", "1"):
-        in_use = {
-            "cores": usage.vcpus_used,
-            "ram": usage.ram_used_mb,
-            "instances": usage.total_instances,
-        }
-        body: dict[str, Any] = {
-            key: {"limit": value, "in_use": in_use.get(key, 0), "reserved": 0}
-            for key, value in limits.items()
-        }
-    else:
-        body = dict(limits)
+    body: dict[str, Any] = dict(quotas.NOVA_DEFAULTS)
+    body |= _legacy_quotas(request, usage.conntrack_max)
     body["id"] = project_id
     return {"quota_set": body}
+
+
+@router.put("/v2.1/os-quota-sets/{project_id}")
+async def update_quota_set(
+    project_id: str,
+    body: dict[str, Any],
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Set this project's compute limits. Enforced on the next boot, not just reported."""
+    try:
+        values = quotas.parse_limits(SERVICE, body.get("quota_set") or {})
+    except quotas.InvalidLimit as exc:
+        raise fault(SERVICE, 400, exc.message)
+    await quotas.set_limits(session, SERVICE, project_id, values)
+    await session.commit()
+    return await _quota_body(session, request, project_id, detail=False)
+
+
+@router.delete("/v2.1/os-quota-sets/{project_id}", status_code=202)
+async def delete_quota_set(
+    project_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Revert this project to the defaults by dropping every override."""
+    await quotas.clear_limits(session, SERVICE, project_id)
+    await session.commit()
+    return Response(status_code=202)
 
 
 @router.get("/v2.1/os-simple-tenant-usage/{project_id}")

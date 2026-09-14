@@ -23,6 +23,14 @@ Two numbers move independently:
   `trusted_image_certificates` (2.63) and `server_groups` (2.71), embeds the flavor only
   from 2.47, and `os-quota-sets` drops the network quotas at 2.36 and the personality-file
   quotas at 2.57.
+- **Per-project quotas, enforced.** `os-quota-sets` gained `/detail`, `/defaults`, `PUT`
+  and `DELETE` on Nova and Cinder, and Neutron gained `/v2.0/quotas` (list), `/default`,
+  `/details`, `PUT` and `DELETE` — so `openstack quota show --usage`, `quota list` and
+  `quota set` work, where they previously returned `404`, `404` and `405`. A stored limit
+  is checked on every create *before* the node's capacity, so it binds whatever the
+  hardware has free: Nova answers `403`, Cinder `413 VolumeLimitExceeded`, Neutron
+  `409 OverQuota`. Usage is counted from live resources. `OPENSTACK_SIMULATOR_ENFORCE_QUOTAS=0`
+  leaves the APIs readable but non-binding.
 - **Marker pagination** on servers, flavors, volumes, snapshots, images, networks,
   subnets, ports, routers, floating IPs, security groups and rules, load balancers,
   listeners and pools. `?limit=N&marker=<id>` with a `<collection>_links` next link
@@ -42,6 +50,11 @@ Two numbers move independently:
 
 ### Changed
 
+- Quota endpoints no longer restate the node's capacity. `os-quota-sets` used to return
+  `cores: 192` and `ram: 261632` — the host envelope, which moved if you changed
+  `OPENSTACK_SIMULATOR_HOST_RAM_MB`. They now return real per-project limits. The seeded
+  `admin` project is given unlimited quotas so the depletion model still binds first on a
+  default install, which is why `quota show` reports `-1` for it.
 - A request that sends no microversion header is now served at the service **minimum**
   rather than the maximum, matching a real deployment. Pin a version — as `openrc.sh` and
   `clouds.yaml` already do — to get the modern response shapes.

@@ -301,6 +301,31 @@ a collection terminates on a short page instead of re-reading page one forever. 
 keyset-based, so it stays correct when resources are created or deleted mid-walk, and an
 unknown marker is a `400` rather than a silently empty page.
 
+## Quotas
+
+Two different ceilings, and a create is checked against both — quota first, so the error
+names the one you actually hit.
+
+**Capacity** is the node: 192 allocatable vCPU, 256 GB RAM, 4 TB disk, shared by every
+project. **Quota** is one project's policy limit, stored per project and settable:
+
+```bash
+openstack quota set --instances 2 admin
+openstack server create ... # third boot: 403 Quota exceeded for instances: ... 2 of 2
+openstack quota show --usage # limit, in use and reserved per resource
+openstack quota delete admin # back to the defaults
+```
+
+Nova, Cinder and Neutron each own the quotas for their own resources, so one
+`openstack quota set` fans out to three services. Going over reports in each service's own
+dialect: Nova `403`, Cinder `413 VolumeLimitExceeded`, Neutron `409 OverQuota`.
+
+A project with nothing set gets upstream's defaults (10 instances, 20 cores, 50 GB RAM,
+10 volumes, 100 networks). **The seeded `admin` project is deliberately unlimited**, so a
+default install still demonstrates the depletion model below rather than stopping at 10
+instances — set a quota on it to see enforcement. `OPENSTACK_SIMULATOR_ENFORCE_QUOTAS=0`
+leaves the quota APIs readable and writable but binding on nothing.
+
 ## Depletion model
 
 Seeded node `node-01`: 2 sockets / 32 cores / 64 threads, 262144 MB RAM, 4096 GB disk,
@@ -494,8 +519,8 @@ Worth knowing before you trust it for something:
   notably Cinder backups and volume metadata, Glance's image-import workflow and
   metadefs, Neutron trunks/QoS/subnet pools, Octavia L7 policies and statistics, Nova
   server groups and aggregates, Keystone groups and application credentials, Placement
-  writes, and CloudKitty's whole hashmap rate-configuration surface. Quotas are readable
-  but not settable. `docs/gaps.md` has the list.
+  writes, and CloudKitty's whole hashmap rate-configuration surface. `docs/gaps.md` has
+  the list, with what has since been closed marked as such.
 - **Services not simulated:** Heat, Barbican, Magnum, Manila, Ironic, Designate, Ceilometer.
 
 ## License

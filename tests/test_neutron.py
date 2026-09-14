@@ -336,8 +336,12 @@ async def test_floating_ip_on_a_non_external_network_still_needs_a_subnet(api) -
 
 
 async def test_quotas_and_availability_zones(api, cloud) -> None:
+    """The seeded admin project is unlimited; the conntrack envelope still binds."""
     quota = (await api["neutron"].get(f"/v2.0/quotas/{cloud.project_id}")).json()["quota"]
-    assert quota["security_group_rule"] == 65536
+    assert quota["security_group_rule"] == -1
+    # A project that has never been touched gets upstream's defaults instead.
+    fresh = (await api["neutron"].get("/v2.0/quotas/some-other-project")).json()["quota"]
+    assert fresh["security_group_rule"] == 100 and fresh["network"] == 100
     zones = (await api["neutron"].get("/v2.0/availability_zones")).json()["availability_zones"]
     assert {z["resource"] for z in zones} == {"network", "router"}
 

@@ -29,7 +29,9 @@ from app.core.schema import SchemaVersionError
 from app.models.compute import Flavor, Hypervisor
 from app.models.identity import Endpoint, Project, Role, RoleAssignment, Service, User
 from app.models.network import Network, SecurityGroup, SecurityGroupRule, Subnet
+from app.models.quota import UNLIMITED, Quota
 from app.models.storage import Image, VolumeType
+from app.services import quotas as quota_service
 from app.services.networking import allocation_pool
 
 FLAVORS: list[dict[str, Any]] = [
@@ -322,6 +324,33 @@ async def seed_security_group(session: AsyncSession, project_id: str) -> None:
         )
 
 
+async def seed_quotas(session: AsyncSession, project_id: str) -> None:
+    """Give the bootstrap admin project unlimited quotas.
+
+    Quotas and capacity are two different ceilings, and this seeder decides which one the
+    shipped cloud demonstrates. Upstream's defaults (10 instances, 20 cores, 50 GB RAM)
+    would bind long before the node's 256 GB does, so the depletion model -- the thing
+    this simulator exists to show -- would never be reached on a default install.
+
+    Unlimited here is also what an operator actually does with the admin project. A
+    project created afterwards gets the real defaults, so quota enforcement is one
+    ``openstack quota set`` away.
+    """
+    for service in ("nova", "cinder", "neutron"):
+        existing = await quota_service.overrides(session, service, project_id)
+        for resource in quota_service.DEFAULTS[service]:
+            if resource not in existing:
+                session.add(
+                    Quota(
+                        id=deterministic_id(f"quota-{service}-{resource}-{project_id}"),
+                        project_id=project_id,
+                        service=service,
+                        resource=resource,
+                        hard_limit=UNLIMITED,
+                    )
+                )
+
+
 async def seed(reset: bool = False) -> None:
     schema = await init_db(drop=reset)
     async with SessionLocal() as session:
@@ -333,6 +362,7 @@ async def seed(reset: bool = False) -> None:
         await seed_volume_types(session)
         await seed_networks(session, project.id)
         await seed_security_group(session, project.id)
+        await seed_quotas(session, project.id)
         await session.commit()
 
         print(f"Seeded OpenStack-Simulator {__version__} ({schema.summary()})")

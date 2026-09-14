@@ -38,19 +38,21 @@ Still open, cross-cutting:
 
 ---
 
-## Quotas — next
+## Quotas — done
 
-The thread that started this list. Quotas are readable and derived from host capacity;
-nothing can set them.
+Per-project limits are stored (`app/models/quota.py`), served, and **enforced** on create
+ahead of the capacity check (`app/services/quotas.py`). Nova and Cinder have `/detail`,
+`/defaults`, `PUT` and `DELETE`; Neutron has the collection list, `/default`, `/details`,
+`PUT` and `DELETE`.
 
-| Endpoint | Note |
-| --- | --- |
-| `GET /v2.1/os-quota-sets/{project}/detail` | what `openstack quota show --usage` actually calls; the usage data already exists behind a `?usage=` query parameter nothing sends |
-| `GET /v2.1/os-quota-sets/{project}/defaults` | needed by `openstack quota list` |
-| `PUT /v2.1/os-quota-sets/{project}` | needs a stored-override model, and a decision on whether an override caps the depletion model or only reports |
-| `DELETE /v2.1/os-quota-sets/{project}` | revert to defaults |
-| Cinder and Neutron equivalents | `/v3/os-quota-sets/{p}/defaults`, `PUT`; Neutron `PUT /v2.0/quotas/{p}`, `/quotas` list, `/quotas/{p}/default` |
-| `os-quota-class-sets` | class-level defaults |
+Still open here:
+
+- `os-quota-class-sets` — class-level defaults, on Nova and Cinder.
+- Quotas for resources nothing counts yet: `key_pairs`, `metadata_items`, `server_groups`
+  (Nova), `backups` (Cinder), `rbac_policy` and `subnetpool` (Neutron). The limits are
+  stored and reported; there is no usage behind them because the resource itself is not
+  implemented.
+- Octavia quotas (`/v2.0/lbaas/quotas`).
 
 ---
 

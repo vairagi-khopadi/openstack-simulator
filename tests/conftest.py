@@ -40,6 +40,7 @@ from seed import (  # noqa: E402
     seed_identity,
     seed_images,
     seed_networks,
+    seed_quotas,
     seed_security_group,
     seed_volume_types,
 )
@@ -104,6 +105,7 @@ async def cloud() -> Cloud:
         await seed_volume_types(session)
         await seed_networks(session, project.id)
         await seed_security_group(session, project.id)
+        await seed_quotas(session, project.id)
         await session.commit()
         return Cloud(
             project_id=project.id,

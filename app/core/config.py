@@ -155,6 +155,14 @@ class Settings(BaseModel):
         default_factory=lambda: _env("OPENSTACK_SIMULATOR_REQUIRE_AUTH", "1") == "1"
     )
 
+    # -- quotas -----------------------------------------------------------------------
+    # Per-project limits are checked before the node's capacity. Turning this off leaves
+    # the quota APIs readable and writable but binding on nothing, which is how the
+    # simulator behaved before quotas existed.
+    enforce_quotas: bool = Field(
+        default_factory=lambda: _env("OPENSTACK_SIMULATOR_ENFORCE_QUOTAS", "1") == "1"
+    )
+
     # -- rating (CloudKitty), unit costs are per hour ----------------------------------
     rate_vcpu_hour: float = Field(default_factory=lambda: _env_float("OPENSTACK_SIMULATOR_RATE_VCPU_HOUR", 0.02))
     rate_ram_gb_hour: float = Field(

@@ -663,17 +663,20 @@ async def test_server_metadata_endpoints(api) -> None:
 
 
 async def test_quota_set_endpoint(api, cloud) -> None:
+    """The seeded admin project is unlimited, so the node's capacity is what binds."""
     await _boot(api, flavor="m1.medium")
     quota = (await api["nova"].get(
         f"/v2.1/os-quota-sets/{cloud.project_id}")).json()["quota_set"]
     assert quota["id"] == cloud.project_id
-    assert quota["cores"] == 192
-    assert quota["ram"] == 261632
+    assert quota["cores"] == -1
+    assert quota["ram"] == -1
 
+    # Usage is counted for real whether or not a limit binds on it.
     with_usage = (await api["nova"].get(
         f"/v2.1/os-quota-sets/{cloud.project_id}?usage=True")).json()["quota_set"]
-    assert with_usage["cores"] == {"limit": 192, "in_use": 2, "reserved": 0}
-    assert with_usage["ram"]["in_use"] == 4352
+    assert with_usage["cores"] == {"limit": -1, "in_use": 2, "reserved": 0}
+    assert with_usage["ram"]["in_use"] == 4096
+    assert with_usage["instances"]["in_use"] == 1
 
 
 async def test_per_project_tenant_usage(api, cloud) -> None:

@@ -23,6 +23,7 @@ from app.core.pagination import collection_links, page_request, paginate
 from app.core.middleware import AuthContext, OSPayload, fault, require
 from app.models.compute import Server
 from app.models.storage import Snapshot, Volume, VolumeAttachment, VolumeType
+from app.services import quotas
 from app.services.capacity import CapacityError, check_volume_capacity, get_usage
 
 SERVICE = "cinder"
@@ -326,6 +327,18 @@ async def create_volume(
     if not size or size <= 0:
         raise fault(SERVICE, 400, "Invalid input received: 'size' must be a positive integer.")
 
+    # The project's own limits first, then the shared storage pool.
+    try:
+        await quotas.enforce_all(
+            session, SERVICE, auth.project_id, {"volumes": 1, "gigabytes": int(size)}
+        )
+    except quotas.QuotaError as exc:
+        raise fault(
+            SERVICE, 413,
+            f"VolumeLimitExceeded: Maximum number of volumes allowed "
+            f"({exc.limit}) exceeded for quota '{exc.resource}'."
+            if exc.resource == "volumes" else f"VolumeSizeExceedsAvailableQuota: {exc}",
+        )
     try:
         await check_volume_capacity(session, int(size))
     except CapacityError as exc:
@@ -737,22 +750,54 @@ async def limits(
 @router.get("/v3/os-quota-sets/{project_id}")
 async def quota_sets(
     project_id: str,
+    request: Request,
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    usage = await get_usage(session)
-    return {
-        "quota_set": {
-            "id": project_id,
-            "volumes": 100,
-            "snapshots": 100,
-            "gigabytes": int(usage.disk_allocatable_gb),
-            "backups": 10,
-            "backup_gigabytes": 1000,
-            "per_volume_gigabytes": -1,
-            "groups": 10,
-        }
-    }
+    """Block-storage quotas. ``?usage=True`` adds usage, as Cinder's own API does."""
+    if request.query_params.get("usage", "").lower() in ("true", "1"):
+        body: dict[str, Any] = dict(await quotas.detail(session, SERVICE, project_id))
+    else:
+        body = dict(await quotas.limits(session, SERVICE, project_id))
+    body["id"] = project_id
+    return {"quota_set": body}
+
+
+@router.get("/v3/os-quota-sets/{project_id}/defaults")
+async def quota_set_defaults(
+    project_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    return {"quota_set": {**quotas.CINDER_DEFAULTS, "id": project_id}}
+
+
+@router.put("/v3/os-quota-sets/{project_id}")
+async def update_quota_set(
+    project_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Set this project's storage limits, enforced on the next volume create."""
+    try:
+        values = quotas.parse_limits(SERVICE, body.get("quota_set") or {})
+    except quotas.InvalidLimit as exc:
+        raise fault(SERVICE, 400, exc.message)
+    effective = await quotas.set_limits(session, SERVICE, project_id, values)
+    await session.commit()
+    return {"quota_set": {**effective, "id": project_id}}
+
+
+@router.delete("/v3/os-quota-sets/{project_id}")
+async def delete_quota_set(
+    project_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    await quotas.clear_limits(session, SERVICE, project_id)
+    await session.commit()
+    return Response(status_code=200)
 
 
 @router.get("/v3/scheduler-stats/get_pools")
