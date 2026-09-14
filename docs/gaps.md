@@ -100,11 +100,12 @@ Volume actions stop at `os-attach`, `os-detach`, `os-extend`, `os-reset_status`,
 
 ### Glance
 
-Image import workflow (`/v2/images/{id}/import`, `/v2/info/import`, staging) — the modern
-upload path · tasks API · metadata definitions (`/v2/metadefs/*`) · image tags ·
-multi-store (`/v2/info/stores`) · cache API.
+**done** — The import workflow (`/stage`, `/import` for glance-direct and web-download,
+`/v2/info/import`, `/v2/info/stores`), the tasks API, image tags, and full member sharing
+with the pending/accepted handshake.
 
-Member sharing is read-only: `GET /members` with no share, accept, reject or delete.
+Still open: metadata definitions (`/v2/metadefs/*`) · real multi-store (there is one
+store) · cache API · task types other than import.
 
 ### Neutron
 

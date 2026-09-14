@@ -23,6 +23,12 @@ Two numbers move independently:
   `trusted_image_certificates` (2.63) and `server_groups` (2.71), embeds the flavor only
   from 2.47, and `os-quota-sets` drops the network quotas at 2.36 and the personality-file
   quotas at 2.57.
+- **Glance image import** (`/v2/images/{id}/stage`, `/import`, `/v2/info/import`,
+  `/v2/info/stores`) for both `glance-direct` and `web-download`, reaching `active`
+  through a **task** (`/v2/tasks`) rather than immediately — the polling loop the direct
+  `PUT /file` never needed. Plus **image tags** (`PUT`/`DELETE /v2/images/{id}/tags/{tag}`)
+  and full **member sharing**: add, list, show, accept/reject and remove, with the
+  `pending` handshake that stops an image being pushed into another project's listing.
 - **Nova server groups** (`/v2.1/os-server-groups`): CRUD, the `group` scheduler hint on
   boot (both header spellings), membership reported on the server body from 2.71, and the
   2.64 switch from `policies`/`metadata` to `policy`/`rules`. Anti-affinity refuses a
