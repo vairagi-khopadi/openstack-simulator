@@ -77,12 +77,15 @@ server body from 2.71, and the 2.64 change from `policies`/`metadata` to `policy
 Anti-affinity refuses a second member, since one node means there is nowhere else to put
 it; soft policies degrade instead.
 
+**done** — Interface attach/detach and show, server tags (gated on 2.26), flavor update
+(2.55, description only) and `os-flavor-access` with `addTenantAccess` /
+`removeTenantAccess`.
+
 Still open: host aggregates · migrations (`/os-migrations`,
 `/servers/{id}/migrations`) · instance actions (`/servers/{id}/os-instance-actions`) ·
 remote consoles (`/servers/{id}/remote-consoles` — note `os-getConsoleOutput` *is*
-supported as a server action) · server tags · interface attach/detach (only `GET
-/os-interface` exists) · flavor update and `os-flavor-access` · extra-specs writes ·
-volume-attachment update (swap) · server password.
+supported as a server action) · extra-specs writes · volume-attachment update (swap) ·
+server password.
 
 Correctly absent: `os-floating-ips` and Nova-side security-group CRUD — real Nova removed
 both at microversion 2.36.

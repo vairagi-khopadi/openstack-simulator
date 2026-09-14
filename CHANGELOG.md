@@ -23,6 +23,11 @@ Two numbers move independently:
   `trusted_image_certificates` (2.63) and `server_groups` (2.71), embeds the flavor only
   from 2.47, and `os-quota-sets` drops the network quotas at 2.36 and the personality-file
   quotas at 2.57.
+- **Nova interface attach/detach** (`POST`/`DELETE`/`GET /os-interface/{port}`), **server
+  tags** (`/servers/{id}/tags`, gated on 2.26 as Nova gates them), **flavor update** (2.55,
+  description only — editing vcpus would invalidate the booking of every instance already
+  running on the flavor) and **flavor access** (`os-flavor-access`, `addTenantAccess`,
+  `removeTenantAccess`).
 - **Sorting** (`?sort_key=`, `?sort_dir=`) on every paginated collection, composing with
   marker pagination — the keyset seeks on whichever column the sort uses — and **field
   selection** (`?fields=`) on Neutron listings.

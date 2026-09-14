@@ -1908,3 +1908,294 @@ async def delete_server_group(
             server.server_group_id = None
     await session.commit()
     return Response(status_code=204)
+
+
+# --------------------------------------------------------------------------------------
+# Interface attach / detach
+# --------------------------------------------------------------------------------------
+
+
+def _interface_dict(port: Port) -> dict[str, Any]:
+    return {
+        "port_state": port.status,
+        "fixed_ips": [{"subnet_id": port.subnet_id, "ip_address": port.ip_address}],
+        "net_id": port.network_id,
+        "port_id": port.id,
+        "mac_addr": port.mac_address,
+        "tag": None,
+    }
+
+
+@router.get("/v2.1/servers/{server_id}/os-interface/{port_id}")
+async def show_interface(
+    server_id: str,
+    port_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    server = await _get_server(session, server_id)
+    port = await session.get(Port, port_id)
+    if port is None or port.device_id != server.id:
+        raise fault(SERVICE, 404, f"Instance {server_id} has no port {port_id}.")
+    return {"interfaceAttachment": _interface_dict(port)}
+
+
+@router.post("/v2.1/servers/{server_id}/os-interface")
+async def attach_interface(
+    server_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Attach a new vNIC: either an existing port, or a fresh one on a named network."""
+    server = await _get_server(session, server_id)
+    if server.status not in ("ACTIVE", "SHUTOFF", "PAUSED"):
+        raise fault(
+            SERVICE,
+            409,
+            f"Cannot attach an interface while instance {server_id} is in "
+            f"{server.status}.",
+        )
+    payload = (body or {}).get("interfaceAttachment") or {}
+
+    if payload.get("port_id"):
+        port = await session.get(Port, payload["port_id"])
+        if port is None:
+            raise fault(SERVICE, 404, f"Port {payload['port_id']} could not be found.")
+        if port.device_id:
+            raise fault(
+                SERVICE, 409, f"Port {port.id} is already attached to {port.device_id}."
+            )
+        port.device_id = server.id
+        port.device_owner = "compute:nova"
+    else:
+        network_id = payload.get("net_id")
+        network = await session.get(Network, network_id) if network_id else None
+        if network_id and network is None:
+            raise fault(SERVICE, 404, f"Network {network_id} could not be found.")
+        if network is None:
+            network = await pick_network(session, auth.project_id)
+        try:
+            port = await create_port_record(
+                session, network, auth.project_id, device_id=server.id
+            )
+        except AddressPoolExhausted as exc:
+            raise fault(SERVICE, 400, f"Cannot allocate a fixed IP: {exc}")
+
+    await session.commit()
+    return {"interfaceAttachment": _interface_dict(port)}
+
+
+@router.delete("/v2.1/servers/{server_id}/os-interface/{port_id}", status_code=202)
+async def detach_interface(
+    server_id: str,
+    port_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    server = await _get_server(session, server_id)
+    port = await session.get(Port, port_id)
+    if port is None or port.device_id != server.id:
+        raise fault(SERVICE, 404, f"Instance {server_id} has no port {port_id}.")
+    # Nova deletes a port it created for the attach and merely releases one it was
+    # handed; both leave the instance without that vNIC, which is what matters here.
+    await session.delete(port)
+    await session.commit()
+    return Response(status_code=202)
+
+
+# --------------------------------------------------------------------------------------
+# Server tags (2.26)
+# --------------------------------------------------------------------------------------
+
+
+def _require_tags_version(request: Request) -> None:
+    if not at_least(request, "2.26"):
+        raise fault(SERVICE, 404, "Server tags require microversion 2.26 or later.")
+
+
+@router.get("/v2.1/servers/{server_id}/tags")
+async def list_server_tags(
+    server_id: str,
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    _require_tags_version(request)
+    server = await _get_server(session, server_id)
+    return {"tags": list(server.tags or [])}
+
+
+@router.put("/v2.1/servers/{server_id}/tags")
+async def replace_server_tags(
+    server_id: str,
+    body: dict[str, Any],
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    _require_tags_version(request)
+    server = await _get_server(session, server_id)
+    tags = (body or {}).get("tags")
+    if not isinstance(tags, list):
+        raise fault(SERVICE, 400, "Invalid input for field 'tags': expected a list.")
+    server.tags = sorted({str(tag) for tag in tags})
+    server.updated_at = now_utc()
+    await session.commit()
+    return {"tags": list(server.tags)}
+
+
+@router.put("/v2.1/servers/{server_id}/tags/{tag}", status_code=201)
+async def add_server_tag(
+    server_id: str,
+    tag: str,
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    _require_tags_version(request)
+    server = await _get_server(session, server_id)
+    existing = list(server.tags or [])
+    if tag in existing:
+        # Already there: Nova reports 204 rather than creating it again.
+        return Response(status_code=204)
+    server.tags = sorted([*existing, tag])
+    server.updated_at = now_utc()
+    await session.commit()
+    return Response(status_code=201)
+
+
+@router.delete("/v2.1/servers/{server_id}/tags/{tag}", status_code=204)
+async def delete_server_tag(
+    server_id: str,
+    tag: str,
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    _require_tags_version(request)
+    server = await _get_server(session, server_id)
+    existing = list(server.tags or [])
+    if tag not in existing:
+        raise fault(SERVICE, 404, f"Server {server_id} has no tag {tag}.")
+    server.tags = [t for t in existing if t != tag]
+    server.updated_at = now_utc()
+    await session.commit()
+    return Response(status_code=204)
+
+
+@router.delete("/v2.1/servers/{server_id}/tags", status_code=204)
+async def delete_all_server_tags(
+    server_id: str,
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    _require_tags_version(request)
+    server = await _get_server(session, server_id)
+    server.tags = []
+    server.updated_at = now_utc()
+    await session.commit()
+    return Response(status_code=204)
+
+
+# --------------------------------------------------------------------------------------
+# Flavor update (2.55) and access
+# --------------------------------------------------------------------------------------
+
+
+@router.put("/v2.1/flavors/{flavor_id}")
+async def update_flavor(
+    flavor_id: str,
+    body: dict[str, Any],
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """2.55 made the description editable -- and only the description."""
+    if not at_least(request, "2.55"):
+        raise fault(SERVICE, 404, "Updating a flavor requires microversion 2.55 or later.")
+    flavor = await session.get(Flavor, flavor_id)
+    if flavor is None:
+        raise fault(SERVICE, 404, f"Flavor {flavor_id} could not be found.")
+    payload = (body or {}).get("flavor") or {}
+    # Resizing a flavor would silently invalidate the booking of every instance already
+    # running on it, which is why Nova does not allow it either.
+    unsupported = set(payload) - {"description"}
+    if unsupported:
+        raise fault(
+            SERVICE,
+            400,
+            f"Invalid input: only 'description' can be updated, not {sorted(unsupported)}.",
+        )
+    flavor.description = payload.get("description")
+    await session.commit()
+    return {"flavor": flavor_dict(flavor)}
+
+
+@router.get("/v2.1/flavors/{flavor_id}/os-flavor-access")
+async def flavor_access(
+    flavor_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    flavor = await session.get(Flavor, flavor_id)
+    if flavor is None:
+        raise fault(SERVICE, 404, f"Flavor {flavor_id} could not be found.")
+    if flavor.is_public:
+        raise fault(
+            SERVICE,
+            404,
+            f"Flavor {flavor_id} is public; access lists apply to private flavors only.",
+        )
+    return {
+        "flavor_access": [
+            {"flavor_id": flavor.id, "tenant_id": project}
+            for project in (flavor.extra_specs or {}).get("_access", [])
+        ]
+    }
+
+
+@router.post("/v2.1/flavors/{flavor_id}/action")
+async def flavor_action(
+    flavor_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """addTenantAccess / removeTenantAccess, the two actions a flavor has."""
+    flavor = await session.get(Flavor, flavor_id)
+    if flavor is None:
+        raise fault(SERVICE, 404, f"Flavor {flavor_id} could not be found.")
+    if flavor.is_public:
+        raise fault(
+            SERVICE, 409, f"Flavor {flavor_id} is public and has no access list."
+        )
+
+    specs = dict(flavor.extra_specs or {})
+    access = list(specs.get("_access", []))
+    if "addTenantAccess" in body:
+        project = (body["addTenantAccess"] or {}).get("tenant")
+        if not project:
+            raise fault(SERVICE, 400, "addTenantAccess requires a tenant.")
+        if project in access:
+            raise fault(
+                SERVICE, 409, f"Flavor access already exists for project {project}."
+            )
+        access.append(project)
+    elif "removeTenantAccess" in body:
+        project = (body["removeTenantAccess"] or {}).get("tenant")
+        if project not in access:
+            raise fault(SERVICE, 404, f"Flavor access not found for project {project}.")
+        access.remove(project)
+    else:
+        raise fault(SERVICE, 400, f"Invalid flavor action: {list(body)[:1]}")
+
+    specs["_access"] = access
+    flavor.extra_specs = specs
+    await session.commit()
+    return {
+        "flavor_access": [
+            {"flavor_id": flavor.id, "tenant_id": project} for project in access
+        ]
+    }
