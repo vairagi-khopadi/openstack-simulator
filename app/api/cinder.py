@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,7 +23,15 @@ from app.core.database import get_session
 from app.core.pagination import collection_links, page_request, paginate
 from app.core.middleware import AuthContext, OSPayload, fault, require
 from app.models.compute import Server
-from app.models.storage import Backup, Snapshot, Volume, VolumeAttachment, VolumeType
+from app.models.storage import (
+    Backup,
+    Image,
+    Snapshot,
+    Volume,
+    VolumeAttachment,
+    VolumeTransfer,
+    VolumeType,
+)
 from app.services import quotas
 from app.services.capacity import CapacityError, check_volume_capacity, get_usage
 
@@ -44,6 +53,9 @@ COLLECTIONS: frozenset[str] = frozenset(
         "extensions",
         "os-quota-sets",
         "os-volume-transfer",
+        # Every new top-level collection has to be listed here, or the middleware above
+        # mistakes its first segment for a project id and strips it.
+        "volume-transfers",
         "group_types",
         "groups",
         "messages",
@@ -195,6 +207,13 @@ def volume_type_dict(vtype: VolumeType) -> dict[str, Any]:
         "extra_specs": dict(vtype.extra_specs or {}),
         "qos_specs_id": None,
     }
+
+
+async def _get_snapshot(session: AsyncSession, snapshot_id: str) -> Snapshot:
+    snapshot = await session.get(Snapshot, snapshot_id)
+    if snapshot is None or snapshot.deleted:
+        raise fault(SERVICE, 404, f"Snapshot {snapshot_id} could not be found.")
+    return resolve_snapshot(snapshot)
 
 
 async def _get_volume(session: AsyncSession, volume_id: str) -> Volume:
@@ -475,6 +494,93 @@ async def volume_action(
         volume.status = "reverting"
         volume.transition_until = transition_deadline()
         volume.transition_target = "available"
+    elif action == "revert_to_snapshot":
+        snapshot = await _get_snapshot(session, argument.get("snapshot_id", ""))
+        if snapshot.volume_id != volume.id:
+            raise fault(
+                SERVICE,
+                400,
+                f"Invalid snapshot: snapshot {snapshot.id} does not belong to "
+                f"volume {volume.id}.",
+            )
+        # Cinder only reverts to the *latest* snapshot: older ones would need the
+        # intermediate deltas, which no longer exist once a newer snapshot was taken.
+        latest = (
+            await session.execute(
+                select(Snapshot)
+                .where(Snapshot.volume_id == volume.id, Snapshot.deleted.is_(False))
+                .order_by(Snapshot.created_at.desc())
+            )
+        ).scalars().first()
+        if latest is not None and latest.id != snapshot.id:
+            raise fault(
+                SERVICE,
+                400,
+                f"Invalid snapshot: only the latest snapshot {latest.id} can be "
+                f"reverted to.",
+            )
+        volume.status = "reverting"
+        volume.transition_until = transition_deadline()
+        volume.transition_target = "available"
+    elif action == "os-retype":
+        new_type = argument.get("new_type")
+        target = (
+            await session.execute(select(VolumeType).where(VolumeType.name == new_type))
+        ).scalars().first()
+        if target is None:
+            raise fault(SERVICE, 400, f"Invalid volume type: {new_type} does not exist.")
+        if target.name == volume.volume_type:
+            raise fault(
+                SERVICE, 400, f"Invalid volume: it already uses type {new_type}."
+            )
+        volume.volume_type = target.name
+        volume.status = "retyping"
+        volume.transition_until = transition_deadline()
+        volume.transition_target = "available"
+    elif action == "os-volume_upload_image":
+        if volume.status not in ("available", "in-use"):
+            raise fault(
+                SERVICE,
+                400,
+                f"Invalid volume: it must be available or in-use to be uploaded, "
+                f"is {volume.status}.",
+            )
+        image_name = argument.get("image_name") or f"image-from-{volume.id[:8]}"
+        image = Image(
+            id=gen_id(),
+            name=image_name,
+            owner=auth.project_id,
+            status="queued",
+            visibility=argument.get("visibility", "private"),
+            container_format=argument.get("container_format", "bare"),
+            disk_format=argument.get("disk_format", "raw"),
+            min_disk=volume.size,
+            size=volume.size * 1024 * 1024 * 1024,
+            virtual_size=volume.size * 1024 * 1024 * 1024,
+            properties={"source_volid": volume.id},
+        )
+        session.add(image)
+        volume.status = "uploading"
+        volume.transition_until = transition_deadline()
+        volume.transition_target = "available"
+        await session.commit()
+        return JSONResponse(
+            {
+                "os-volume_upload_image": {
+                    "id": volume.id,
+                    "updated_at": iso_us(volume.updated_at),
+                    "status": "uploading",
+                    "display_description": volume.description,
+                    "size": volume.size,
+                    "volume_type": {"name": volume.volume_type},
+                    "image_id": image.id,
+                    "container_format": image.container_format,
+                    "disk_format": image.disk_format,
+                    "image_name": image_name,
+                }
+            },
+            status_code=202,
+        )
     else:
         raise fault(SERVICE, 400, f"Unsupported volume action: {action}")
 
@@ -1180,5 +1286,260 @@ async def delete_backup(
     backup.deleted = True
     backup.status = "deleting"
     backup.updated_at = now_utc()
+    await session.commit()
+    return Response(status_code=202)
+
+
+# --------------------------------------------------------------------------------------
+# Volume and snapshot metadata
+# --------------------------------------------------------------------------------------
+
+
+@router.get("/v3/volumes/{volume_id}/metadata")
+async def get_volume_metadata(
+    volume_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    volume = await _get_volume(session, volume_id)
+    return {"metadata": dict(volume.metadata_ or {})}
+
+
+@router.put("/v3/volumes/{volume_id}/metadata")
+async def replace_volume_metadata(
+    volume_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """PUT replaces the whole dict; POST below merges into it."""
+    volume = await _get_volume(session, volume_id)
+    volume.metadata_ = dict((body or {}).get("metadata") or {})
+    volume.updated_at = now_utc()
+    await session.commit()
+    return {"metadata": dict(volume.metadata_)}
+
+
+@router.post("/v3/volumes/{volume_id}/metadata")
+async def update_volume_metadata(
+    volume_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    volume = await _get_volume(session, volume_id)
+    volume.metadata_ = dict(volume.metadata_ or {}) | dict((body or {}).get("metadata") or {})
+    volume.updated_at = now_utc()
+    await session.commit()
+    return {"metadata": dict(volume.metadata_)}
+
+
+@router.get("/v3/volumes/{volume_id}/metadata/{key}")
+async def get_volume_metadata_item(
+    volume_id: str,
+    key: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    volume = await _get_volume(session, volume_id)
+    metadata = dict(volume.metadata_ or {})
+    if key not in metadata:
+        raise fault(SERVICE, 404, f"Metadata item {key} could not be found.")
+    return {"meta": {key: metadata[key]}}
+
+
+@router.put("/v3/volumes/{volume_id}/metadata/{key}")
+async def set_volume_metadata_item(
+    volume_id: str,
+    key: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    volume = await _get_volume(session, volume_id)
+    meta = (body or {}).get("meta") or {}
+    if key not in meta:
+        raise fault(SERVICE, 400, f"Request body key {key} does not match the URI.")
+    volume.metadata_ = dict(volume.metadata_ or {}) | {key: meta[key]}
+    volume.updated_at = now_utc()
+    await session.commit()
+    return {"meta": {key: meta[key]}}
+
+
+@router.delete("/v3/volumes/{volume_id}/metadata/{key}", status_code=200)
+async def delete_volume_metadata_item(
+    volume_id: str,
+    key: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    volume = await _get_volume(session, volume_id)
+    metadata = dict(volume.metadata_ or {})
+    if key not in metadata:
+        raise fault(SERVICE, 404, f"Metadata item {key} could not be found.")
+    del metadata[key]
+    volume.metadata_ = metadata
+    volume.updated_at = now_utc()
+    await session.commit()
+    return Response(status_code=200)
+
+
+@router.get("/v3/snapshots/{snapshot_id}/metadata")
+async def get_snapshot_metadata(
+    snapshot_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    snapshot = await _get_snapshot(session, snapshot_id)
+    return {"metadata": dict(snapshot.metadata_ or {})}
+
+
+@router.put("/v3/snapshots/{snapshot_id}/metadata")
+async def replace_snapshot_metadata(
+    snapshot_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    snapshot = await _get_snapshot(session, snapshot_id)
+    snapshot.metadata_ = dict((body or {}).get("metadata") or {})
+    snapshot.updated_at = now_utc()
+    await session.commit()
+    return {"metadata": dict(snapshot.metadata_)}
+
+
+# --------------------------------------------------------------------------------------
+# Volume transfers
+# --------------------------------------------------------------------------------------
+
+
+def transfer_dict(transfer: VolumeTransfer, auth_key: str | None = None) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "id": transfer.id,
+        "name": transfer.name,
+        "volume_id": transfer.volume_id,
+        "created_at": iso_us(transfer.created_at),
+        "no_snapshots": transfer.no_snapshots,
+        "links": [
+            {"rel": "self",
+             "href": service_url(SERVICE, f"/v3/volume-transfers/{transfer.id}")}
+        ],
+    }
+    # The key is returned exactly once, when the transfer is created. Reading it back
+    # later would defeat the point of having it.
+    if auth_key is not None:
+        body["auth_key"] = auth_key
+    return body
+
+
+@router.get("/v3/volume-transfers")
+@router.get("/v3/os-volume-transfer")
+async def list_transfers(
+    auth: AuthContext = auth_dep, session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    rows = (
+        await session.execute(
+            select(VolumeTransfer).where(
+                VolumeTransfer.project_id == auth.project_id,
+                VolumeTransfer.accepted.is_(False),
+            )
+        )
+    ).scalars().all()
+    return {"transfers": [transfer_dict(t) for t in rows]}
+
+
+@router.post("/v3/volume-transfers", status_code=202)
+@router.post("/v3/os-volume-transfer", status_code=202)
+async def create_transfer(
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    payload = (body or {}).get("transfer") or {}
+    volume = await _get_volume(session, payload.get("volume_id", ""))
+    if volume.status != "available":
+        raise fault(
+            SERVICE,
+            400,
+            f"Invalid volume: Volume {volume.id} must be available to be transferred, "
+            f"is {volume.status}.",
+        )
+    transfer = VolumeTransfer(
+        id=gen_id(),
+        name=payload.get("name"),
+        volume_id=volume.id,
+        project_id=auth.project_id,
+        auth_key=gen_id().replace("-", "")[:16],
+        no_snapshots=bool(payload.get("no_snapshots", False)),
+    )
+    session.add(transfer)
+    # The volume is parked for the duration: neither side should be using it while
+    # ownership is in flight.
+    volume.status = "awaiting-transfer"
+    await session.commit()
+    return {"transfer": transfer_dict(transfer, auth_key=transfer.auth_key)}
+
+
+@router.get("/v3/volume-transfers/{transfer_id}")
+@router.get("/v3/os-volume-transfer/{transfer_id}")
+async def get_transfer(
+    transfer_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    transfer = await session.get(VolumeTransfer, transfer_id)
+    if transfer is None or transfer.accepted:
+        raise fault(SERVICE, 404, f"Transfer {transfer_id} could not be found.")
+    return {"transfer": transfer_dict(transfer)}
+
+
+@router.post("/v3/volume-transfers/{transfer_id}/accept", status_code=202)
+@router.post("/v3/os-volume-transfer/{transfer_id}/accept", status_code=202)
+async def accept_transfer(
+    transfer_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    transfer = await session.get(VolumeTransfer, transfer_id)
+    if transfer is None or transfer.accepted:
+        raise fault(SERVICE, 404, f"Transfer {transfer_id} could not be found.")
+    supplied = ((body or {}).get("accept") or {}).get("auth_key")
+    if supplied != transfer.auth_key:
+        raise fault(SERVICE, 400, "Invalid auth key for this transfer.")
+
+    volume = await session.get(Volume, transfer.volume_id)
+    if volume is None or volume.deleted:
+        raise fault(SERVICE, 404, f"Volume {transfer.volume_id} could not be found.")
+    volume.project_id = auth.project_id
+    volume.user_id = auth.user_id
+    volume.status = "available"
+    transfer.accepted = True
+    await session.commit()
+    return {
+        "transfer": {
+            "id": transfer.id,
+            "name": transfer.name,
+            "volume_id": volume.id,
+            "links": transfer_dict(transfer)["links"],
+        }
+    }
+
+
+@router.delete("/v3/volume-transfers/{transfer_id}", status_code=202)
+@router.delete("/v3/os-volume-transfer/{transfer_id}", status_code=202)
+async def delete_transfer(
+    transfer_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Cancelling hands the volume back to the project that offered it."""
+    transfer = await session.get(VolumeTransfer, transfer_id)
+    if transfer is None or transfer.accepted:
+        raise fault(SERVICE, 404, f"Transfer {transfer_id} could not be found.")
+    volume = await session.get(Volume, transfer.volume_id)
+    if volume is not None and volume.status == "awaiting-transfer":
+        volume.status = "available"
+    await session.delete(transfer)
     await session.commit()
     return Response(status_code=202)

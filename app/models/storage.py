@@ -163,6 +163,26 @@ class Task(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class VolumeTransfer(Base):
+    """A pending handover of a volume to another project.
+
+    The auth key is the whole mechanism: the id alone is not enough to accept a transfer,
+    so knowing a volume exists does not let you take it. It is shown exactly once, at
+    creation, and never again.
+    """
+
+    __tablename__ = "volume_transfers"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_id)
+    name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    volume_id: Mapped[str] = mapped_column(String(64), index=True)
+    project_id: Mapped[str] = mapped_column(String(64), index=True)
+    auth_key: Mapped[str] = mapped_column(String(64))
+    no_snapshots: Mapped[bool] = mapped_column(Boolean, default=False)
+    accepted: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+
+
 class Backup(Base):
     """A volume backup.
 

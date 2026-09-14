@@ -97,12 +97,13 @@ restore into a new or existing volume, and `os-reset_status` / `os-force_delete`
 by the `backups` and `backup_gigabytes` quota rather than the node's disk pool, since a
 real backup lands in object storage.
 
-Still open: volume and snapshot metadata · volume transfers · consistency groups and
-group types · QoS specs · volume-type extra specs and encryption · `/v3/messages` ·
-`os-services` / `os-hosts` · manage/unmanage · default types.
+**done** — Volume and snapshot metadata (whole-dict and per-key), volume transfers with
+the auth-key handshake, and the volume actions `os-retype`, `os-volume_upload_image` and
+`revert_to_snapshot`.
 
-Volume actions stop at `os-attach`, `os-detach`, `os-extend`, `os-reset_status`,
-`os-set_bootable` — no retype, migrate, upload-to-image or revert-to-snapshot.
+Still open: consistency groups and group types · QoS specs · volume-type extra specs and
+encryption · `/v3/messages` · `os-services` / `os-hosts` · manage/unmanage · default types ·
+volume migrate.
 
 ### Glance
 

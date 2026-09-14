@@ -23,6 +23,12 @@ Two numbers move independently:
   `trusted_image_certificates` (2.63) and `server_groups` (2.71), embeds the flavor only
   from 2.47, and `os-quota-sets` drops the network quotas at 2.36 and the personality-file
   quotas at 2.57.
+- **Cinder volume and snapshot metadata** (`PUT` replaces, `POST` merges, plus per-key
+  `GET`/`PUT`/`DELETE`), **volume transfers** (`/v3/volume-transfers` and the legacy
+  `/v3/os-volume-transfer`) with the auth key that makes them safe — shown once at
+  creation and required to accept — and the volume actions **`os-retype`**,
+  **`os-volume_upload_image`** (which creates a real Glance image) and
+  **`revert_to_snapshot`**, which only accepts the latest snapshot.
 - **Nova interface attach/detach** (`POST`/`DELETE`/`GET /os-interface/{port}`), **server
   tags** (`/servers/{id}/tags`, gated on 2.26 as Nova gates them), **flavor update** (2.55,
   description only — editing vcpus would invalidate the booking of every instance already

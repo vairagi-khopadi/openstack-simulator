@@ -52,6 +52,7 @@ from app.models.storage import (
     Task,
     Volume,
     VolumeAttachment,
+    VolumeTransfer,
     VolumeType,
 )
 
@@ -103,5 +104,6 @@ __all__ = [
     "User",
     "Volume",
     "VolumeAttachment",
+    "VolumeTransfer",
     "VolumeType",
 ]
