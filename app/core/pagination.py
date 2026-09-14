@@ -54,6 +54,8 @@ class Page:
     limit: int
     marker: str | None
     requested_limit: bool  # did the client name a limit, or is this the default?
+    sort_key: str | None = None
+    sort_dir: str = "desc"
 
 
 def page_request(params: Any, service: str) -> Page:
@@ -71,11 +73,32 @@ def page_request(params: Any, service: str) -> Page:
         limit = default
     if limit <= 0:
         limit = default
+    # Neutron spells the direction per key ("sort_dir" repeated); Nova and Cinder send
+    # one of each. Taking the first of each covers both without pretending to support
+    # multi-key sorting, which nothing here needs.
+    sort_dir = (params.get("sort_dir") or "").lower()
     return Page(
         limit=min(limit, MAX_LIMIT),
         marker=params.get("marker") or None,
         requested_limit=raw is not None,
+        sort_key=params.get("sort_key") or None,
+        sort_dir=sort_dir if sort_dir in ("asc", "desc") else "",
     )
+
+
+def sort_column_for(model: Any, page: Page, default: Any) -> tuple[Any, bool]:
+    """Resolve ``?sort_key=`` against the model, falling back to the collection default.
+
+    An unknown key is ignored rather than refused: it is how clients probe for support,
+    and a 400 there would break a listing that works perfectly well unsorted.
+    """
+    column = default
+    if page.sort_key:
+        candidate = getattr(model, page.sort_key, None)
+        # Only real mapped columns -- getattr would happily return a method otherwise.
+        if candidate is not None and hasattr(candidate, "asc"):
+            column = candidate
+    return column, page.sort_dir
 
 
 async def paginate(
@@ -94,6 +117,11 @@ async def paginate(
     column alone is what makes that position unambiguous when several rows share a
     timestamp, which at simulator speed they routinely do.
     """
+    # An explicit ?sort_dir wins over the collection's own default direction.
+    sort_column, requested_dir = sort_column_for(model, page, sort_column)
+    if requested_dir:
+        descending = requested_dir == "desc"
+
     order = (
         (sort_column.desc(), model.id.desc())
         if descending
@@ -158,4 +186,46 @@ def glance_links(
     if marker is not None:
         query = _next_query(request.query_params, marker, page.limit, page.requested_limit)
         body["next"] = f"{path}?{query}"
+    return body
+
+
+# --------------------------------------------------------------------------------------
+# Field selection
+# --------------------------------------------------------------------------------------
+
+
+def requested_fields(params: Any) -> set[str]:
+    """The ``?fields=`` set, empty when the client wants everything.
+
+    Neutron repeats the parameter (``?fields=id&fields=name``); the others comma-separate
+    it. Both are accepted, because a client that guesses wrong should still get a useful
+    answer rather than a silently unfiltered one.
+    """
+    raw: list[str] = []
+    if hasattr(params, "getlist"):
+        raw = list(params.getlist("fields"))
+    elif params.get("fields"):
+        raw = [params["fields"]]
+    wanted = {
+        part.strip()
+        for value in raw
+        for part in str(value).split(",")
+        if part.strip()
+    }
+    return wanted
+
+
+def trim(body: Any, fields: set[str]) -> Any:
+    """Keep only ``fields`` in a resource dict, or in every dict of a list.
+
+    ``id`` is always kept: a listing whose entries cannot be identified is not a useful
+    saving, and every client that pages needs it for the marker.
+    """
+    if not fields:
+        return body
+    keep = fields | {"id"}
+    if isinstance(body, list):
+        return [trim(item, fields) for item in body]
+    if isinstance(body, dict):
+        return {key: value for key, value in body.items() if key in keep}
     return body

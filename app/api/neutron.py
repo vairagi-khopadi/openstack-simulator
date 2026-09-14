@@ -14,7 +14,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import gen_id, iso_us, now_utc, settings
 from app.core.database import get_session
 from app.services import quotas as quota_service
-from app.core.pagination import collection_links, page_request, paginate
+from app.core.pagination import (
+    collection_links,
+    page_request,
+    paginate,
+    requested_fields,
+    trim,
+)
 from app.core.middleware import AuthContext, OSPayload, body_object, fault, require
 from app.models.quota import Quota
 from app.models.network import (
@@ -506,9 +512,10 @@ async def list_networks(
     )
     networks = list((await session.execute(stmt)).scalars().all())
     return {
-        "networks": [
-            network_dict(n, await _subnet_ids(session, n.id)) for n in networks
-        ],
+        "networks": trim(
+            [network_dict(n, await _subnet_ids(session, n.id)) for n in networks],
+            requested_fields(request.query_params),
+        ),
         **collection_links(request, "networks", networks, page),
     }
 
@@ -631,7 +638,9 @@ async def list_subnets(
     )
     subnets = list((await session.execute(stmt)).scalars().all())
     return {
-        "subnets": [subnet_dict(s) for s in subnets],
+        "subnets": trim(
+            [subnet_dict(s) for s in subnets], requested_fields(request.query_params)
+        ),
         **collection_links(request, "subnets", subnets, page),
     }
 
@@ -788,7 +797,9 @@ async def list_ports(
     )
     ports = list((await session.execute(stmt)).scalars().all())
     return {
-        "ports": [port_dict(p) for p in ports],
+        "ports": trim(
+            [port_dict(p) for p in ports], requested_fields(request.query_params)
+        ),
         **collection_links(request, "ports", ports, page),
     }
 
@@ -900,7 +911,10 @@ async def list_security_groups(
     )
     groups = list((await session.execute(stmt)).scalars().all())
     return {
-        "security_groups": [security_group_dict(g) for g in groups],
+        "security_groups": trim(
+            [security_group_dict(g) for g in groups],
+            requested_fields(request.query_params),
+        ),
         **collection_links(request, "security_groups", groups, page),
     }
 
@@ -1111,7 +1125,9 @@ async def list_floating_ips(
     )
     fips = list((await session.execute(stmt)).scalars().all())
     return {
-        "floatingips": [floating_ip_dict(f) for f in fips],
+        "floatingips": trim(
+            [floating_ip_dict(f) for f in fips], requested_fields(request.query_params)
+        ),
         **collection_links(request, "floatingips", fips, page),
     }
 
@@ -1375,9 +1391,10 @@ async def list_routers(
     )
     routers = list((await session.execute(stmt)).scalars().all())
     return {
-        "routers": [
-            router_dict(r, await _router_ports(session, r.id)) for r in routers
-        ],
+        "routers": trim(
+            [router_dict(r, await _router_ports(session, r.id)) for r in routers],
+            requested_fields(request.query_params),
+        ),
         **collection_links(request, "routers", routers, page),
     }
 

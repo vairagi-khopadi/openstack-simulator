@@ -27,8 +27,11 @@ These affected every service and are now implemented.
 
 Still open, cross-cutting:
 
-- **Sorting.** No `sort_key` / `sort_dir` on any listing.
-- **Field selection.** No `fields=` to trim a response.
+- **done** — Sorting. `?sort_key=` / `?sort_dir=` on every paginated listing, resolved
+  against the model with an unknown key ignored rather than refused. The marker keyset
+  seeks on the sorted column, so sorting and pagination compose.
+- **done** — Field selection. `?fields=` trims Neutron listings (comma-separated or
+  repeated), always keeping `id`.
 - **Tags.** No tags API on any resource — Neutron resource tags, Nova server tags
   (`/servers/{id}/tags`), Glance image tags.
 - **Unified limits.** Keystone `/v3/limits` and `/v3/registered_limits`, the modern

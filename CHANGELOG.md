@@ -23,6 +23,9 @@ Two numbers move independently:
   `trusted_image_certificates` (2.63) and `server_groups` (2.71), embeds the flavor only
   from 2.47, and `os-quota-sets` drops the network quotas at 2.36 and the personality-file
   quotas at 2.57.
+- **Sorting** (`?sort_key=`, `?sort_dir=`) on every paginated collection, composing with
+  marker pagination — the keyset seeks on whichever column the sort uses — and **field
+  selection** (`?fields=`) on Neutron listings.
 - **Neutron trunks** (`/v2.0/trunks`, `add_subports`, `remove_subports`) with the
   exclusivity rules that make them coherent — a port is a parent or a subport, never both
   and never twice — and per-trunk VLAN ids validated against the 1–4094 range.
