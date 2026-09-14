@@ -2,6 +2,7 @@
 floating IPs -- with simulated IPAM and conntrack accounting."""
 from __future__ import annotations
 
+import ipaddress
 import random
 from typing import Any
 
@@ -17,6 +18,9 @@ from app.core.pagination import collection_links, page_request, paginate
 from app.core.middleware import AuthContext, OSPayload, body_object, fault, require
 from app.models.quota import Quota
 from app.models.network import (
+    SubPort,
+    SubnetPool,
+    Trunk,
     FloatingIP,
     Network,
     Port,
@@ -66,6 +70,8 @@ class SubnetPayload(OSPayload):
     host_routes: list[dict[str, Any]] = Field(default_factory=list)
     allocation_pools: list[dict[str, str]] = Field(default_factory=list)
     description: str = ""
+    subnetpool_id: str | None = None
+    prefixlen: int | None = None
 
 
 class PortPayload(OSPayload):
@@ -642,8 +648,31 @@ async def create_subnet(
     if network is None:
         raise fault(SERVICE, 404, f"Network {payload.network_id} could not be found.",
                     type="NetworkNotFound")
-    if not payload.cidr:
+    cidr = payload.cidr
+    if payload.subnetpool_id:
+        # Ask the pool for space instead of naming it: the caller wants "a /26", not a
+        # particular /26, and the pool guarantees it will not collide with another.
+        pool = await _get_pool(session, payload.subnetpool_id)
+        prefixlen = payload.prefixlen or pool.default_prefixlen
+        if not (pool.min_prefixlen <= prefixlen <= pool.max_prefixlen):
+            raise fault(
+                SERVICE,
+                400,
+                f"Prefix length /{prefixlen} is outside the pool's range "
+                f"/{pool.min_prefixlen}-/{pool.max_prefixlen}.",
+                type="HTTPBadRequest",
+            )
+        taken = list(
+            (
+                await session.execute(
+                    select(Subnet.cidr).where(Subnet.subnetpool_id == pool.id)
+                )
+            ).scalars().all()
+        )
+        cidr = _allocate_from_pool(pool, taken, prefixlen)
+    if not cidr:
         raise fault(SERVICE, 400, "A cidr must be supplied.", type="BadRequest")
+    payload.cidr = cidr
     try:
         gateway, start, end = allocation_pool(payload.cidr)
     except ValueError as exc:
@@ -658,6 +687,7 @@ async def create_subnet(
         network_id=network.id,
         project_id=auth.project_id,
         cidr=payload.cidr,
+        subnetpool_id=payload.subnetpool_id,
         ip_version=payload.ip_version,
         gateway_ip=payload.gateway_ip or gateway,
         enable_dhcp=payload.enable_dhcp,
@@ -1522,3 +1552,449 @@ async def remove_router_interface(
     record.updated_at = now_utc()
     await session.commit()
     return result
+
+
+# --------------------------------------------------------------------------------------
+# Subnet pools
+# --------------------------------------------------------------------------------------
+
+
+class SubnetPoolPayload(OSPayload):
+    name: str
+    prefixes: list[str] = Field(default_factory=list)
+    default_prefixlen: int | None = None
+    min_prefixlen: int | None = None
+    max_prefixlen: int | None = None
+    shared: bool = False
+    is_default: bool = False
+    description: str = ""
+    address_scope_id: str | None = None
+    default_quota: int | None = None
+
+
+def subnet_pool_dict(pool: SubnetPool) -> dict[str, Any]:
+    return {
+        "id": pool.id,
+        "name": pool.name,
+        "project_id": pool.project_id,
+        "tenant_id": pool.project_id,
+        "prefixes": list(pool.prefixes or []),
+        "default_prefixlen": str(pool.default_prefixlen),
+        "min_prefixlen": str(pool.min_prefixlen),
+        "max_prefixlen": str(pool.max_prefixlen),
+        "ip_version": pool.ip_version,
+        "shared": pool.shared,
+        "is_default": pool.is_default,
+        "description": pool.description,
+        "address_scope_id": pool.address_scope_id,
+        "default_quota": pool.default_quota,
+        "created_at": iso_us(pool.created_at),
+        "updated_at": iso_us(pool.updated_at),
+        "revision_number": 0,
+    }
+
+
+async def _get_pool(session: AsyncSession, pool_id: str) -> SubnetPool:
+    pool = await session.get(SubnetPool, pool_id)
+    if pool is None:
+        raise fault(SERVICE, 404, f"Subnet pool {pool_id} could not be found.",
+                    type="SubnetPoolNotFound")
+    return pool
+
+
+def _allocate_from_pool(pool: SubnetPool, taken: list[str], prefixlen: int) -> str:
+    """Carve the next free prefix of this length out of the pool.
+
+    Walks each of the pool's prefixes in order and returns the first candidate that
+    overlaps nothing already allocated -- which is the guarantee a pool exists to make.
+    """
+    used = [ipaddress.ip_network(cidr) for cidr in taken]
+    for raw in pool.prefixes or []:
+        parent = ipaddress.ip_network(raw)
+        if prefixlen < parent.prefixlen:
+            continue  # a bigger block than the pool itself holds
+        for candidate in parent.subnets(new_prefix=prefixlen):
+            if not any(candidate.overlaps(existing) for existing in used):
+                return str(candidate)
+    raise fault(
+        SERVICE,
+        409,
+        f"Subnet pool {pool.id} has no free prefix of length /{prefixlen} left.",
+        type="SubnetPoolQuotaExceeded",
+    )
+
+
+@router.get("/v2.0/subnetpools")
+async def list_subnet_pools(
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    stmt = select(SubnetPool)
+    if not auth.is_admin:
+        stmt = stmt.where(
+            (SubnetPool.project_id == auth.project_id) | SubnetPool.shared.is_(True)
+        )
+    if "name" in request.query_params:
+        stmt = stmt.where(SubnetPool.name == request.query_params["name"])
+    page = page_request(request.query_params, SERVICE)
+    stmt = await paginate(
+        session, stmt, SubnetPool, page, sort_column=SubnetPool.created_at,
+        descending=False,
+    )
+    pools = list((await session.execute(stmt)).scalars().all())
+    return {
+        "subnetpools": [subnet_pool_dict(p) for p in pools],
+        **collection_links(request, "subnetpools", pools, page),
+    }
+
+
+@router.post("/v2.0/subnetpools", status_code=201)
+async def create_subnet_pool(
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    payload = SubnetPoolPayload(**body_object(SERVICE, body, "subnetpool"))
+    if not payload.prefixes:
+        raise fault(SERVICE, 400, "A subnet pool requires at least one prefix.",
+                    type="HTTPBadRequest")
+    try:
+        networks = [ipaddress.ip_network(prefix) for prefix in payload.prefixes]
+    except ValueError as exc:
+        raise fault(SERVICE, 400, f"Invalid prefix: {exc}", type="HTTPBadRequest")
+
+    await _enforce(session, auth.project_id, "subnetpool")
+
+    version = networks[0].version
+    pool = SubnetPool(
+        id=gen_id(),
+        name=payload.name,
+        project_id=auth.project_id,
+        prefixes=[str(n) for n in networks],
+        default_prefixlen=payload.default_prefixlen or (24 if version == 4 else 64),
+        min_prefixlen=payload.min_prefixlen or (8 if version == 4 else 64),
+        max_prefixlen=payload.max_prefixlen or (32 if version == 4 else 128),
+        ip_version=version,
+        shared=payload.shared,
+        is_default=payload.is_default,
+        description=payload.description,
+        address_scope_id=payload.address_scope_id,
+        default_quota=payload.default_quota,
+    )
+    session.add(pool)
+    await session.commit()
+    return {"subnetpool": subnet_pool_dict(pool)}
+
+
+@router.get("/v2.0/subnetpools/{pool_id}")
+async def get_subnet_pool(
+    pool_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    return {"subnetpool": subnet_pool_dict(await _get_pool(session, pool_id))}
+
+
+@router.put("/v2.0/subnetpools/{pool_id}")
+async def update_subnet_pool(
+    pool_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    pool = await _get_pool(session, pool_id)
+    payload = body_object(SERVICE, body, "subnetpool")
+    for field in ("name", "description", "shared", "is_default", "default_quota"):
+        if field in payload:
+            setattr(pool, field, payload[field])
+    if "prefixes" in payload:
+        # Neutron only ever grows a pool: shrinking would strand allocations inside it.
+        existing = set(pool.prefixes or [])
+        pool.prefixes = sorted(existing | set(payload["prefixes"]))
+    pool.updated_at = now_utc()
+    await session.commit()
+    return {"subnetpool": subnet_pool_dict(pool)}
+
+
+@router.delete("/v2.0/subnetpools/{pool_id}", status_code=204)
+async def delete_subnet_pool(
+    pool_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    pool = await _get_pool(session, pool_id)
+    allocated = (
+        await session.execute(
+            select(Subnet.id).where(Subnet.subnetpool_id == pool.id)
+        )
+    ).scalars().first()
+    if allocated:
+        raise fault(
+            SERVICE,
+            409,
+            f"Subnet pool {pool_id} is in use by one or more subnets.",
+            type="SubnetPoolInUse",
+        )
+    await session.delete(pool)
+    await session.commit()
+    return Response(status_code=204)
+
+
+# --------------------------------------------------------------------------------------
+# Trunks
+# --------------------------------------------------------------------------------------
+
+
+class TrunkPayload(OSPayload):
+    port_id: str
+    name: str = ""
+    description: str = ""
+    admin_state_up: bool = True
+    sub_ports: list[dict[str, Any]] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+
+
+def subport_dict(subport: SubPort) -> dict[str, Any]:
+    return {
+        "port_id": subport.port_id,
+        "segmentation_type": subport.segmentation_type,
+        "segmentation_id": subport.segmentation_id,
+    }
+
+
+def trunk_dict(trunk: Trunk, subports: list[SubPort]) -> dict[str, Any]:
+    return {
+        "id": trunk.id,
+        "name": trunk.name,
+        "description": trunk.description,
+        "project_id": trunk.project_id,
+        "tenant_id": trunk.project_id,
+        "port_id": trunk.port_id,
+        "status": trunk.status,
+        "admin_state_up": trunk.admin_state_up,
+        "sub_ports": [subport_dict(s) for s in subports],
+        "tags": list(trunk.tags or []),
+        "created_at": iso_us(trunk.created_at),
+        "updated_at": iso_us(trunk.updated_at),
+        "revision_number": 0,
+    }
+
+
+async def _get_trunk(session: AsyncSession, trunk_id: str) -> Trunk:
+    trunk = await session.get(Trunk, trunk_id)
+    if trunk is None or trunk.deleted:
+        raise fault(SERVICE, 404, f"Trunk {trunk_id} could not be found.",
+                    type="TrunkNotFound")
+    return trunk
+
+
+async def _trunk_subports(session: AsyncSession, trunk_id: str) -> list[SubPort]:
+    return list(
+        (
+            await session.execute(
+                select(SubPort)
+                .where(SubPort.trunk_id == trunk_id)
+                .order_by(SubPort.segmentation_id)
+            )
+        ).scalars().all()
+    )
+
+
+async def _port_is_in_use(session: AsyncSession, port_id: str) -> str | None:
+    """Whether a port is already a trunk parent or a subport somewhere.
+
+    A port carries one role at a time: being both a parent and a subport, or a subport of
+    two trunks, would make its traffic ambiguous.
+    """
+    parent = (
+        await session.execute(
+            select(Trunk.id).where(Trunk.port_id == port_id, Trunk.deleted.is_(False))
+        )
+    ).scalars().first()
+    if parent:
+        return f"port {port_id} is already the parent of trunk {parent}"
+    child = (
+        await session.execute(select(SubPort.trunk_id).where(SubPort.port_id == port_id))
+    ).scalars().first()
+    if child:
+        return f"port {port_id} is already a subport of trunk {child}"
+    return None
+
+
+async def _add_subports(
+    session: AsyncSession, trunk: Trunk, entries: list[dict[str, Any]]
+) -> None:
+    existing = {s.segmentation_id for s in await _trunk_subports(session, trunk.id)}
+    for entry in entries:
+        port_id = entry.get("port_id")
+        if not port_id:
+            raise fault(SERVICE, 400, "A subport requires a port_id.", type="HTTPBadRequest")
+        port = await session.get(Port, port_id)
+        if port is None:
+            raise fault(SERVICE, 404, f"Port {port_id} could not be found.",
+                        type="PortNotFound")
+        if port_id == trunk.port_id:
+            raise fault(
+                SERVICE, 409,
+                f"Port {port_id} is the trunk's own parent port.",
+                type="TrunkPortInUse",
+            )
+        conflict = await _port_is_in_use(session, port_id)
+        if conflict:
+            raise fault(SERVICE, 409, f"Cannot add subport: {conflict}.",
+                        type="TrunkPortInUse")
+        try:
+            segmentation_id = int(entry.get("segmentation_id"))
+        except (TypeError, ValueError):
+            raise fault(SERVICE, 400, "A subport requires an integer segmentation_id.",
+                        type="HTTPBadRequest")
+        if not 1 <= segmentation_id <= 4094:
+            raise fault(
+                SERVICE, 400,
+                f"segmentation_id {segmentation_id} is outside the VLAN range 1-4094.",
+                type="HTTPBadRequest",
+            )
+        if segmentation_id in existing:
+            raise fault(
+                SERVICE, 409,
+                f"Segmentation id {segmentation_id} is already used on this trunk.",
+                type="DuplicateSubPort",
+            )
+        existing.add(segmentation_id)
+        session.add(
+            SubPort(
+                id=gen_id(),
+                trunk_id=trunk.id,
+                port_id=port_id,
+                segmentation_type=entry.get("segmentation_type", "vlan"),
+                segmentation_id=segmentation_id,
+            )
+        )
+
+
+@router.get("/v2.0/trunks")
+async def list_trunks(
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    stmt = scope_to_project(
+        select(Trunk).where(Trunk.deleted.is_(False)), Trunk, auth, request
+    )
+    page = page_request(request.query_params, SERVICE)
+    stmt = await paginate(
+        session, stmt, Trunk, page, sort_column=Trunk.created_at, descending=False
+    )
+    trunks = list((await session.execute(stmt)).scalars().all())
+    return {
+        "trunks": [
+            trunk_dict(t, await _trunk_subports(session, t.id)) for t in trunks
+        ],
+        **collection_links(request, "trunks", trunks, page),
+    }
+
+
+@router.post("/v2.0/trunks", status_code=201)
+async def create_trunk(
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    payload = TrunkPayload(**body_object(SERVICE, body, "trunk"))
+    port = await session.get(Port, payload.port_id)
+    if port is None:
+        raise fault(SERVICE, 404, f"Port {payload.port_id} could not be found.",
+                    type="PortNotFound")
+    conflict = await _port_is_in_use(session, payload.port_id)
+    if conflict:
+        raise fault(SERVICE, 409, f"Cannot create trunk: {conflict}.",
+                    type="TrunkPortInUse")
+    await _enforce(session, auth.project_id, "trunk")
+
+    trunk = Trunk(
+        id=gen_id(),
+        name=payload.name or f"trunk-{gen_id()[:8]}",
+        description=payload.description,
+        project_id=auth.project_id,
+        port_id=payload.port_id,
+        admin_state_up=payload.admin_state_up,
+        tags=payload.tags,
+    )
+    session.add(trunk)
+    await session.flush()
+    await _add_subports(session, trunk, payload.sub_ports)
+    await session.commit()
+    return {"trunk": trunk_dict(trunk, await _trunk_subports(session, trunk.id))}
+
+
+@router.get("/v2.0/trunks/{trunk_id}")
+async def get_trunk(
+    trunk_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    trunk = await _get_trunk(session, trunk_id)
+    return {"trunk": trunk_dict(trunk, await _trunk_subports(session, trunk.id))}
+
+
+@router.put("/v2.0/trunks/{trunk_id}")
+async def update_trunk(
+    trunk_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    trunk = await _get_trunk(session, trunk_id)
+    payload = body_object(SERVICE, body, "trunk")
+    for field in ("name", "description", "admin_state_up", "tags"):
+        if field in payload:
+            setattr(trunk, field, payload[field])
+    trunk.updated_at = now_utc()
+    await session.commit()
+    return {"trunk": trunk_dict(trunk, await _trunk_subports(session, trunk.id))}
+
+
+@router.put("/v2.0/trunks/{trunk_id}/add_subports")
+async def add_subports(
+    trunk_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    trunk = await _get_trunk(session, trunk_id)
+    await _add_subports(session, trunk, (body or {}).get("sub_ports") or [])
+    trunk.updated_at = now_utc()
+    await session.commit()
+    return trunk_dict(trunk, await _trunk_subports(session, trunk.id))
+
+
+@router.put("/v2.0/trunks/{trunk_id}/remove_subports")
+async def remove_subports(
+    trunk_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    trunk = await _get_trunk(session, trunk_id)
+    wanted = {entry.get("port_id") for entry in (body or {}).get("sub_ports") or []}
+    for subport in await _trunk_subports(session, trunk.id):
+        if subport.port_id in wanted:
+            await session.delete(subport)
+    trunk.updated_at = now_utc()
+    await session.commit()
+    return trunk_dict(trunk, await _trunk_subports(session, trunk.id))
+
+
+@router.delete("/v2.0/trunks/{trunk_id}", status_code=204)
+async def delete_trunk(
+    trunk_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    trunk = await _get_trunk(session, trunk_id)
+    for subport in await _trunk_subports(session, trunk.id):
+        await session.delete(subport)
+    trunk.deleted = True
+    await session.commit()
+    return Response(status_code=204)

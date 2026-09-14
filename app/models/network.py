@@ -4,7 +4,15 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.config import gen_id, now_utc
@@ -49,6 +57,9 @@ class Subnet(Base):
     )
     project_id: Mapped[str] = mapped_column(String(64), index=True)
     cidr: Mapped[str] = mapped_column(String(64))
+    # Set when the cidr was carved out of a pool rather than given explicitly; it is
+    # what stops the pool being deleted out from under the allocation.
+    subnetpool_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     ip_version: Mapped[int] = mapped_column(Integer, default=4)
     gateway_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     enable_dhcp: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -95,6 +106,75 @@ class Port(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+
+
+class SubnetPool(Base):
+    """A pool of address space subnets are carved out of.
+
+    The point of a pool is that a tenant can ask for "a /26" without knowing or caring
+    which one, and that two allocations never overlap.
+    """
+
+    __tablename__ = "subnet_pools"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_id)
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    project_id: Mapped[str] = mapped_column(String(64), index=True)
+    prefixes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    default_prefixlen: Mapped[int] = mapped_column(Integer, default=24)
+    min_prefixlen: Mapped[int] = mapped_column(Integer, default=8)
+    max_prefixlen: Mapped[int] = mapped_column(Integer, default=32)
+    ip_version: Mapped[int] = mapped_column(Integer, default=4)
+    shared: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    description: Mapped[str] = mapped_column(String(1024), default="")
+    address_scope_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    default_quota: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+
+
+class Trunk(Base):
+    """A parent port carrying several networks, one per VLAN tag.
+
+    An instance gets one vNIC and reaches every subport through it. The rules worth
+    modelling are the exclusivity ones: a port can be the parent of only one trunk, a
+    subport of only one trunk, and never both at once.
+    """
+
+    __tablename__ = "trunks"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_id)
+    name: Mapped[str] = mapped_column(String(255), default="", index=True)
+    description: Mapped[str] = mapped_column(String(1024), default="")
+    project_id: Mapped[str] = mapped_column(String(64), index=True)
+    port_id: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="ACTIVE")
+    admin_state_up: Mapped[bool] = mapped_column(Boolean, default=True)
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    deleted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+
+
+class SubPort(Base):
+    """One network carried on a trunk, identified by its segmentation id."""
+
+    __tablename__ = "subports"
+    __table_args__ = (
+        UniqueConstraint("trunk_id", "segmentation_id", name="uq_trunk_segmentation"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_id)
+    trunk_id: Mapped[str] = mapped_column(
+        ForeignKey("trunks.id", ondelete="CASCADE"), index=True
+    )
+    port_id: Mapped[str] = mapped_column(String(64), index=True)
+    segmentation_type: Mapped[str] = mapped_column(String(32), default="vlan")
+    segmentation_id: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
 
 
 class SecurityGroup(Base):

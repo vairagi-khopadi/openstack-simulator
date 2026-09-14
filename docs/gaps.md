@@ -109,12 +109,15 @@ store) · cache API · task types other than import.
 
 ### Neutron
 
-Trunks · QoS policies and rules · subnet pools · RBAC policies · address scopes and
-groups · segments · FWaaS · VPNaaS · agents and agent scheduling · floating-IP port
-forwarding · extra routes · network IP availability · auto-allocated topology.
+**done** — Trunks (with subport add/remove and the exclusivity rules) and subnet pools
+(with real non-overlapping allocation, so `subnetpool_id` on a subnet carves the next free
+prefix out of the pool).
 
-Note `subnetpool` and `rbac_policy` are *counted in the quota response* while having no
-endpoints behind them.
+Still open: QoS policies and rules · RBAC policies · address scopes and groups · segments ·
+FWaaS · VPNaaS · agents and agent scheduling · floating-IP port forwarding · extra routes ·
+network IP availability · auto-allocated topology.
+
+`rbac_policy` is still counted in the quota response with no endpoints behind it.
 
 ### Placement
 

@@ -36,7 +36,10 @@ from app.models.network import (
     Router,
     SecurityGroup,
     SecurityGroupRule,
+    SubPort,
     Subnet,
+    SubnetPool,
+    Trunk,
 )
 from app.models.objectstore import Container, ObjectMetadata, SwiftAccount
 from app.models.quota import UNLIMITED, Quota
@@ -90,10 +93,13 @@ __all__ = [
     "ServerGroup",
     "Service",
     "Snapshot",
+    "SubPort",
     "Subnet",
+    "SubnetPool",
     "SwiftAccount",
     "Task",
     "Token",
+    "Trunk",
     "User",
     "Volume",
     "VolumeAttachment",

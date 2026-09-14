@@ -29,6 +29,8 @@ from app.models.network import (
     SecurityGroup,
     SecurityGroupRule,
     Subnet,
+    SubnetPool,
+    Trunk,
 )
 from app.models.quota import UNLIMITED, Quota
 from app.models.storage import Backup, Snapshot, Volume
@@ -71,6 +73,7 @@ NEUTRON_DEFAULTS: dict[str, int] = {
     "security_group_rule": 100,
     "rbac_policy": 10,
     "subnetpool": UNLIMITED,
+    "trunk": UNLIMITED,
 }
 
 DEFAULTS: dict[str, dict[str, int]] = {
@@ -248,6 +251,8 @@ _COUNTERS: dict[str, dict[str, Counter]] = {
         "floatingip": Counter(FloatingIP, extra=lambda m: (m.released.is_(False),)),
         "security_group": Counter(SecurityGroup),
         "security_group_rule": Counter(SecurityGroupRule),
+        "subnetpool": Counter(SubnetPool),
+        "trunk": Counter(Trunk),
     },
 }
 

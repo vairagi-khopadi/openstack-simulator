@@ -23,6 +23,13 @@ Two numbers move independently:
   `trusted_image_certificates` (2.63) and `server_groups` (2.71), embeds the flavor only
   from 2.47, and `os-quota-sets` drops the network quotas at 2.36 and the personality-file
   quotas at 2.57.
+- **Neutron trunks** (`/v2.0/trunks`, `add_subports`, `remove_subports`) with the
+  exclusivity rules that make them coherent — a port is a parent or a subport, never both
+  and never twice — and per-trunk VLAN ids validated against the 1–4094 range.
+- **Neutron subnet pools** (`/v2.0/subnetpools`), with allocation that actually computes:
+  `subnetpool_id` on a subnet carves out the next free prefix, guaranteed not to overlap
+  an existing one, and an exhausted pool answers `409`. A pool in use cannot be deleted,
+  and an update only ever grows its prefixes.
 - **Octavia L7 policies and rules** (`/v2/lbaas/l7policies`, `/rules`): full CRUD, the
   per-action validation Octavia does (`REDIRECT_TO_POOL` needs a pool, `REDIRECT_TO_URL`
   a url, `HEADER`/`COOKIE`/`SSL_DN_FIELD` rules a key), and position renumbering across a
