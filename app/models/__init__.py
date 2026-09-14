@@ -39,6 +39,7 @@ from app.models.objectstore import Container, ObjectMetadata, SwiftAccount
 from app.models.quota import UNLIMITED, Quota
 from app.models.storage import (
     VOLUME_STATES_HOLDING_DISK,
+    Backup,
     Image,
     Snapshot,
     Volume,
@@ -53,6 +54,7 @@ __all__ = [
     "VALID_ACTIONS",
     "UNLIMITED",
     "VALID_SERVICES",
+    "Backup",
     "Container",
     "Endpoint",
     "FailureInjection",

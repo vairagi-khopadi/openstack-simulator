@@ -23,6 +23,12 @@ Two numbers move independently:
   `trusted_image_certificates` (2.63) and `server_groups` (2.71), embeds the flavor only
   from 2.47, and `os-quota-sets` drops the network quotas at 2.36 and the personality-file
   quotas at 2.57.
+- **Cinder backups** (`/v3/backups`): create, list, detail, show, update, delete,
+  restore into a new or existing volume, and the `os-reset_status` / `os-force_delete`
+  actions. Incremental backups chain onto the last available full backup, and a parent
+  with children refuses to be deleted. A backup is bounded by the `backups` and
+  `backup_gigabytes` quota and not by the node's disk pool — on a real cloud it lands in
+  object storage, not on the compute node.
 - **Per-project quotas, enforced.** `os-quota-sets` gained `/detail`, `/defaults`, `PUT`
   and `DELETE` on Nova and Cinder, and Neutron gained `/v2.0/quotas` (list), `/default`,
   `/details`, `PUT` and `DELETE` — so `openstack quota show --usage`, `quota list` and

@@ -81,8 +81,13 @@ both at microversion 2.36.
 
 ### Cinder
 
-Backups · volume and snapshot metadata · volume transfers · consistency groups and group
-types · QoS specs · volume-type extra specs and encryption · `/v3/messages` ·
+**done** — Backups: create (full and incremental), list, detail, show, update, delete,
+restore into a new or existing volume, and `os-reset_status` / `os-force_delete`. Bounded
+by the `backups` and `backup_gigabytes` quota rather than the node's disk pool, since a
+real backup lands in object storage.
+
+Still open: volume and snapshot metadata · volume transfers · consistency groups and
+group types · QoS specs · volume-type extra specs and encryption · `/v3/messages` ·
 `os-services` / `os-hosts` · manage/unmanage · default types.
 
 Volume actions stop at `os-attach`, `os-detach`, `os-extend`, `os-reset_status`,

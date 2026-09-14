@@ -31,7 +31,7 @@ from app.models.network import (
     Subnet,
 )
 from app.models.quota import UNLIMITED, Quota
-from app.models.storage import Snapshot, Volume
+from app.models.storage import Backup, Snapshot, Volume
 
 # --------------------------------------------------------------------------------------
 # Defaults
@@ -236,6 +236,8 @@ _COUNTERS: dict[str, dict[str, Counter]] = {
         "volumes": Counter(Volume),
         "gigabytes": Counter(Volume, Volume.size),
         "snapshots": Counter(Snapshot),
+        "backups": Counter(Backup),
+        "backup_gigabytes": Counter(Backup, Backup.size),
     },
     "neutron": {
         "network": Counter(Network),

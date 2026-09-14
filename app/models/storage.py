@@ -111,6 +111,41 @@ class Snapshot(Base):
     deleted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
 
+class Backup(Base):
+    """A volume backup.
+
+    Backups live in object storage on a real cloud, not on the compute node's disks, so
+    unlike a volume a backup does not come out of the depletion pool -- only out of the
+    project's ``backups`` and ``backup_gigabytes`` quota.
+    """
+
+    __tablename__ = "backups"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=gen_id)
+    name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    description: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    volume_id: Mapped[str] = mapped_column(String(64), index=True)
+    snapshot_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    project_id: Mapped[str] = mapped_column(String(64), index=True)
+    size: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(32), default="creating")
+    container: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    availability_zone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # An incremental backup depends on the full one before it, which is why Cinder
+    # refuses to delete a backup that still has children.
+    is_incremental: Mapped[bool] = mapped_column(Boolean, default=False)
+    parent_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    fail_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    metadata_: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+
+    transition_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    transition_target: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    deleted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+
+
 class Image(Base):
     """Glance image catalog entry. Uploaded bytes are discarded; only size is kept."""
 

@@ -22,7 +22,7 @@ from app.core.database import get_session
 from app.core.pagination import collection_links, page_request, paginate
 from app.core.middleware import AuthContext, OSPayload, fault, require
 from app.models.compute import Server
-from app.models.storage import Snapshot, Volume, VolumeAttachment, VolumeType
+from app.models.storage import Backup, Snapshot, Volume, VolumeAttachment, VolumeType
 from app.services import quotas
 from app.services.capacity import CapacityError, check_volume_capacity, get_usage
 
@@ -822,3 +822,363 @@ async def get_pools(
             }
         ]
     }
+
+
+# --------------------------------------------------------------------------------------
+# Backups
+# --------------------------------------------------------------------------------------
+
+
+class BackupPayload(OSPayload):
+    volume_id: str
+    name: str | None = None
+    description: str | None = None
+    container: str | None = None
+    incremental: bool = False
+    force: bool = False
+    snapshot_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+def resolve_backup(backup: Backup) -> Backup:
+    if settle_transition(backup):
+        backup.updated_at = now_utc()
+    return backup
+
+
+def backup_dict(backup: Backup) -> dict[str, Any]:
+    return {
+        "id": backup.id,
+        "name": backup.name,
+        "description": backup.description,
+        "volume_id": backup.volume_id,
+        "snapshot_id": backup.snapshot_id,
+        "status": backup.status,
+        "size": backup.size,
+        "object_count": max(backup.size, 1),
+        "container": backup.container,
+        "availability_zone": backup.availability_zone,
+        "has_dependent_backups": False,
+        "is_incremental": backup.is_incremental,
+        "fail_reason": backup.fail_reason,
+        "data_timestamp": iso_us(backup.created_at),
+        "created_at": iso_us(backup.created_at),
+        "updated_at": iso_us(backup.updated_at),
+        "metadata": dict(backup.metadata_ or {}),
+        "os-backup-project-attr:project_id": backup.project_id,
+        "user_id": backup.project_id,
+        "links": [
+            {"rel": "self", "href": service_url(SERVICE, f"/v3/backups/{backup.id}")}
+        ],
+    }
+
+
+async def _get_backup(session: AsyncSession, backup_id: str) -> Backup:
+    backup = await session.get(Backup, backup_id)
+    if backup is None or backup.deleted:
+        raise fault(SERVICE, 404, f"Backup {backup_id} could not be found.")
+    return resolve_backup(backup)
+
+
+async def _dependent_backups(session: AsyncSession, backup_id: str) -> bool:
+    """True when an incremental backup was taken on top of this one."""
+    return bool(
+        (
+            await session.execute(
+                select(Backup.id).where(
+                    Backup.parent_id == backup_id, Backup.deleted.is_(False)
+                )
+            )
+        ).first()
+    )
+
+
+@router.get("/v3/backups")
+@router.get("/v3/backups/detail")
+async def list_backups(
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    stmt = select(Backup).where(
+        Backup.deleted.is_(False), Backup.project_id == auth.project_id
+    )
+    if "volume_id" in request.query_params:
+        stmt = stmt.where(Backup.volume_id == request.query_params["volume_id"])
+    if "status" in request.query_params:
+        stmt = stmt.where(Backup.status == request.query_params["status"])
+    page = page_request(request.query_params, SERVICE)
+    stmt = await paginate(session, stmt, Backup, page, sort_column=Backup.created_at)
+    rows = list((await session.execute(stmt)).scalars().all())
+    for backup in rows:
+        resolve_backup(backup)
+    await session.commit()
+
+    detail = request.url.path.endswith("/detail")
+    if detail:
+        body: list[dict[str, Any]] = [backup_dict(b) for b in rows]
+    else:
+        body = [
+            {
+                "id": b.id,
+                "name": b.name,
+                "links": [
+                    {"rel": "self", "href": service_url(SERVICE, f"/v3/backups/{b.id}")}
+                ],
+            }
+            for b in rows
+        ]
+    return {"backups": body, **collection_links(request, "backups", rows, page)}
+
+
+@router.post("/v3/backups", status_code=202)
+async def create_backup(
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    payload = BackupPayload(**(body.get("backup") or {}))
+    volume = await _get_volume(session, payload.volume_id)
+    # Cinder refuses to back up an attached volume unless forced: the filesystem is live
+    # and the copy would be crash-consistent at best.
+    if volume.status == "in-use" and not payload.force:
+        raise fault(
+            SERVICE,
+            400,
+            f"Invalid volume: Volume {volume.id} to be backed up must be available "
+            f"or must be forced.",
+        )
+    if volume.status not in ("available", "in-use"):
+        raise fault(
+            SERVICE,
+            400,
+            f"Invalid volume: Volume {volume.id} is in {volume.status} status.",
+        )
+
+    try:
+        await quotas.enforce_all(
+            session,
+            SERVICE,
+            auth.project_id,
+            {"backups": 1, "backup_gigabytes": volume.size},
+        )
+    except quotas.QuotaError as exc:
+        raise fault(SERVICE, 413, f"BackupLimitExceeded: {exc}")
+
+    parent_id: str | None = None
+    if payload.incremental:
+        # Status is settled lazily on read, so filtering on it in SQL would miss a
+        # backup whose window has elapsed but which nothing has looked at yet.
+        candidates = (
+            await session.execute(
+                select(Backup)
+                .where(Backup.volume_id == volume.id, Backup.deleted.is_(False))
+                .order_by(Backup.created_at.desc())
+            )
+        ).scalars().all()
+        parent = next(
+            (b for b in candidates if resolve_backup(b).status == "available"), None
+        )
+        if parent is None:
+            raise fault(
+                SERVICE,
+                400,
+                "Invalid backup: No backups available to do an incremental backup.",
+            )
+        parent_id = parent.id
+
+    backup = Backup(
+        id=gen_id(),
+        name=payload.name,
+        description=payload.description,
+        volume_id=volume.id,
+        snapshot_id=payload.snapshot_id,
+        project_id=auth.project_id,
+        size=volume.size,
+        status="creating",
+        container=payload.container or "volumebackups",
+        availability_zone="nova",
+        is_incremental=payload.incremental,
+        parent_id=parent_id,
+        metadata_=payload.metadata,
+        transition_until=transition_deadline(),
+        transition_target="available",
+    )
+    session.add(backup)
+    # The volume is held in backing-up until the copy finishes, which is what stops a
+    # second backup or a delete from racing it.
+    if volume.status == "available":
+        volume.status = "backing-up"
+        volume.transition_until = backup.transition_until
+        volume.transition_target = "available"
+    await session.commit()
+    return {"backup": {
+        "id": backup.id,
+        "name": backup.name,
+        "links": backup_dict(backup)["links"],
+    }}
+
+
+@router.get("/v3/backups/{backup_id}")
+async def get_backup(
+    backup_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    backup = await _get_backup(session, backup_id)
+    await session.commit()
+    body = backup_dict(backup)
+    body["has_dependent_backups"] = await _dependent_backups(session, backup.id)
+    return {"backup": body}
+
+
+@router.put("/v3/backups/{backup_id}")
+async def update_backup(
+    backup_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    backup = await _get_backup(session, backup_id)
+    payload = body.get("backup") or {}
+    if "name" in payload:
+        backup.name = payload["name"]
+    if "description" in payload:
+        backup.description = payload["description"]
+    if "metadata" in payload:
+        backup.metadata_ = payload["metadata"]
+    backup.updated_at = now_utc()
+    await session.commit()
+    return {"backup": backup_dict(backup)}
+
+
+@router.post("/v3/backups/{backup_id}/restore")
+async def restore_backup(
+    backup_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Restore into an existing volume, or into a new one created for the purpose."""
+    backup = await _get_backup(session, backup_id)
+    if backup.status != "available":
+        raise fault(
+            SERVICE,
+            400,
+            f"Invalid backup: Backup status must be available, is {backup.status}.",
+        )
+    payload = body.get("restore") or {}
+    volume_id = payload.get("volume_id")
+
+    if volume_id:
+        volume = await _get_volume(session, volume_id)
+        if volume.status != "available":
+            raise fault(
+                SERVICE,
+                400,
+                f"Invalid volume: Volume to be restored to must be available, "
+                f"is {volume.status}.",
+            )
+        if volume.size < backup.size:
+            raise fault(
+                SERVICE,
+                400,
+                f"Invalid volume: volume size {volume.size} is smaller than "
+                f"backup size {backup.size}.",
+            )
+    else:
+        # No target given: Cinder creates one the size of the backup.
+        try:
+            await quotas.enforce_all(
+                session,
+                SERVICE,
+                auth.project_id,
+                {"volumes": 1, "gigabytes": backup.size},
+            )
+        except quotas.QuotaError as exc:
+            raise fault(SERVICE, 413, f"VolumeSizeExceedsAvailableQuota: {exc}")
+        try:
+            await check_volume_capacity(session, backup.size)
+        except CapacityError as exc:
+            raise fault(SERVICE, 413, f"VolumeSizeExceedsAvailableQuota: {exc}")
+        default_type = (
+            await session.execute(select(VolumeType).where(VolumeType.is_default.is_(True)))
+        ).scalars().first()
+        volume = Volume(
+            id=gen_id(),
+            name=payload.get("name") or f"restore_backup_{backup.id}",
+            description=f"Restored from backup {backup.id}",
+            project_id=auth.project_id,
+            user_id=auth.user_id,
+            size=backup.size,
+            status="creating",
+            volume_type=default_type.name if default_type else "__DEFAULT__",
+            availability_zone="nova",
+        )
+        session.add(volume)
+
+    volume.status = "restoring-backup"
+    volume.transition_until = transition_deadline()
+    volume.transition_target = "available"
+    backup.status = "restoring"
+    backup.transition_until = volume.transition_until
+    backup.transition_target = "available"
+    await session.commit()
+    return {
+        "restore": {
+            "backup_id": backup.id,
+            "volume_id": volume.id,
+            "volume_name": volume.name,
+        }
+    }
+
+
+@router.post("/v3/backups/{backup_id}/action")
+async def backup_action(
+    backup_id: str,
+    body: dict[str, Any],
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    backup = await _get_backup(session, backup_id)
+    if "os-reset_status" in body:
+        backup.status = (body["os-reset_status"] or {}).get("status", "available")
+        backup.transition_until = None
+        backup.transition_target = None
+    elif "os-force_delete" in body:
+        backup.deleted = True
+        backup.status = "deleted"
+    else:
+        raise fault(SERVICE, 400, f"Invalid backup action: {list(body)[:1]}")
+    backup.updated_at = now_utc()
+    await session.commit()
+    return Response(status_code=202)
+
+
+@router.delete("/v3/backups/{backup_id}", status_code=202)
+async def delete_backup(
+    backup_id: str,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    backup = await _get_backup(session, backup_id)
+    if backup.status not in ("available", "error"):
+        raise fault(
+            SERVICE,
+            400,
+            f"Invalid backup: Backup status must be available or error, "
+            f"is {backup.status}.",
+        )
+    # An incremental backup is a diff against its parent, so removing the parent would
+    # leave the child unrestorable.
+    if await _dependent_backups(session, backup.id):
+        raise fault(
+            SERVICE,
+            400,
+            "Invalid backup: Incremental backups exist for this backup.",
+        )
+    backup.deleted = True
+    backup.status = "deleting"
+    backup.updated_at = now_utc()
+    await session.commit()
+    return Response(status_code=202)
