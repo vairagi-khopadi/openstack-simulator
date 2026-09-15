@@ -58,6 +58,9 @@ class ObjectMetadata(Base):
     content_type: Mapped[str] = mapped_column(String(255), default="application/octet-stream")
     etag: Mapped[str] = mapped_column(String(64), default="")
     metadata_: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    # X-Delete-At / X-Delete-After. Swift's reaper removes the object later; a read
+    # after this moment already behaves as though it were gone.
+    delete_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_modified: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
 

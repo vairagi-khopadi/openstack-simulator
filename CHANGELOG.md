@@ -23,6 +23,11 @@ Two numbers move independently:
   `trusted_image_certificates` (2.63) and `server_groups` (2.71), embeds the flavor only
   from 2.47, and `os-quota-sets` drops the network quotas at 2.36 and the personality-file
   quotas at 2.57.
+- **Swift bulk delete** (`POST /v1/{account}?bulk-delete`, answering with Swift's summary
+  body so a partial failure still returns 200), server-side **`COPY`**, and **expiring
+  objects** (`X-Delete-After` / `X-Delete-At`). Expiry is enforced on read rather than by
+  a sweep, because Swift's reaper runs on its own schedule and a client must not be able
+  to read an object past its expiry in the meantime.
 - **CloudKitty hashmap configuration**
   (`/v1/rating/module_config/hashmap/...`): services, fields, mappings, thresholds and
   groups, so rates no longer require a restart and an `OPENSTACK_SIMULATOR_RATE_*`

@@ -153,8 +153,15 @@ availability zones · batch member update.
 
 ### Swift
 
-Bulk delete · large objects (SLO/DLO manifests) · object versioning · temp URLs and form
-POST · container ACLs and sync · `COPY` · expiring objects (`X-Delete-After`).
+**done** — Bulk delete (`POST /v1/{account}?bulk-delete`), server-side `COPY`, and
+expiring objects (`X-Delete-After` / `X-Delete-At`, honoured on read rather than by a
+sweep).
+
+Still open: large objects (SLO/DLO manifests) · object versioning · temp URLs and form
+POST · container ACLs and sync.
+
+Note: SLO/DLO would mean storing object structure, which collides with the deliberate
+zero-storage design — worth a decision before it is implemented, not just a ticket.
 
 ### CloudKitty
 

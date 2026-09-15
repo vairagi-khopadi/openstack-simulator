@@ -6,6 +6,7 @@ dropped, so uploading a 10 GB blob costs a few hundred bytes of database and no 
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -189,6 +190,10 @@ async def post_account(
     session: AsyncSession = Depends(get_session),
 ) -> Response:
     project_id = _check_account(auth, account)
+    # Swift overloads POST on the account: with ?bulk-delete it is a batch delete, and
+    # without it a metadata update.
+    if {"bulk-delete", "bulk_delete"} & set(request.query_params):
+        return await _bulk_delete(request, session, project_id)
     record = await _account(session, project_id)
     metadata = dict(record.metadata_ or {})
     metadata.update(_collect_meta(request, "x-account-meta-"))
@@ -356,13 +361,42 @@ async def delete_container(
 async def _object(
     session: AsyncSession, container: Container, name: str
 ) -> ObjectMetadata | None:
-    return (
+    """The object, or None if it is gone -- including expired but not yet reaped.
+
+    Swift's object-expirer deletes on its own schedule, so an expired object can still
+    be on disk. What a client must never see is a successful read of it, which is why
+    expiry is checked here rather than in a sweep.
+    """
+    obj = (
         await session.execute(
             select(ObjectMetadata).where(
                 ObjectMetadata.container_id == container.id, ObjectMetadata.name == name
             )
         )
     ).scalar_one_or_none()
+    if obj is not None and obj.delete_at is not None and obj.delete_at <= now_utc():
+        await session.delete(obj)
+        await session.commit()
+        return None
+    return obj
+
+
+def _expiry_from(headers: Any) -> datetime | None:
+    """Read X-Delete-After (seconds from now) or X-Delete-At (a unix timestamp)."""
+    after = headers.get("X-Delete-After")
+    if after:
+        try:
+            return now_utc() + timedelta(seconds=int(after))
+        except ValueError:
+            return None
+    at = headers.get("X-Delete-At")
+    if at:
+        try:
+            # Naive UTC, matching how every other datetime is stored here.
+            return datetime.fromtimestamp(int(at), tz=timezone.utc).replace(tzinfo=None)
+        except (ValueError, OSError, OverflowError):
+            return None
+    return None
 
 
 @router.put("/v1/{account}/{container}/{object_name:path}", status_code=201)
@@ -406,6 +440,7 @@ async def put_object(
     obj.etag = etag
     obj.content_type = request.headers.get("Content-Type", "application/octet-stream")
     obj.metadata_ = _collect_meta(request, "x-object-meta-")
+    obj.delete_at = _expiry_from(request.headers)
     obj.last_modified = now_utc()
     record.updated_at = obj.last_modified
     await session.commit()
@@ -430,6 +465,8 @@ def _object_headers(obj: ObjectMetadata) -> dict[str, str]:
         "X-Timestamp": _timestamp(obj.last_modified),
         "Accept-Ranges": "bytes",
     }
+    if obj.delete_at is not None:
+        headers["X-Delete-At"] = str(int(obj.delete_at.replace(tzinfo=timezone.utc).timestamp()))
     headers.update(_meta_headers(obj.metadata_, "X-Object-Meta-"))
     return headers
 
@@ -488,6 +525,11 @@ async def post_object(
     obj.metadata_ = {**(obj.metadata_ or {}), **_collect_meta(request, "x-object-meta-")}
     if "Content-Type" in request.headers:
         obj.content_type = request.headers["Content-Type"]
+    expiry = _expiry_from(request.headers)
+    if expiry is not None:
+        obj.delete_at = expiry
+    elif "X-Remove-Delete-At" in request.headers:
+        obj.delete_at = None
     obj.last_modified = now_utc()
     await session.commit()
     return Response(status_code=202)
@@ -509,3 +551,118 @@ async def delete_object(
     await session.delete(obj)
     await session.commit()
     return Response(status_code=204)
+
+
+# --------------------------------------------------------------------------------------
+# COPY and bulk delete
+# --------------------------------------------------------------------------------------
+
+
+def _split_destination(destination: str) -> tuple[str, str]:
+    """``/container/object`` -- the form Swift's Destination header takes."""
+    cleaned = destination.lstrip("/")
+    container, _, name = cleaned.partition("/")
+    if not container or not name:
+        raise fault(SERVICE, 412, "Destination header must be of the form /container/object.")
+    return container, name
+
+
+async def _copy(
+    session: AsyncSession,
+    project_id: str,
+    source: ObjectMetadata,
+    destination: str,
+    request: Request,
+) -> Response:
+    container_name, object_name = _split_destination(destination)
+    target = await _container(session, project_id, container_name)
+    if target is None:
+        raise fault(SERVICE, 404, "Destination container not found.")
+
+    existing = await _object(session, target, object_name)
+    if existing is None:
+        existing = ObjectMetadata(
+            id=gen_id(),
+            container_id=target.id,
+            name=object_name,
+            project_id=project_id,
+        )
+        session.add(existing)
+    # No bytes were stored, so a copy is the metadata and the checksum over bytes that
+    # were hashed on the way past -- which is all a client can verify anyway.
+    existing.bytes = source.bytes
+    existing.etag = source.etag
+    existing.content_type = request.headers.get("Content-Type", source.content_type)
+    existing.metadata_ = {
+        **(source.metadata_ or {}),
+        **_collect_meta(request, "x-object-meta-"),
+    }
+    existing.delete_at = _expiry_from(request.headers)
+    existing.last_modified = now_utc()
+    target.updated_at = existing.last_modified
+    await session.commit()
+    return Response(
+        status_code=201,
+        headers={
+            "ETag": source.etag,
+            "Content-Length": "0",
+            "X-Copied-From": f"{source.container_id}/{source.name}",
+            "Last-Modified": _http_date(existing.last_modified),
+        },
+    )
+
+
+@router.api_route("/v1/{account}/{container}/{object_name:path}", methods=["COPY"])
+async def copy_object(
+    account: str,
+    container: str,
+    object_name: str,
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """COPY with a Destination header -- the server-side copy Swift offers."""
+    project_id = _check_account(auth, account)
+    record = await _container(session, project_id, container)
+    source = await _object(session, record, object_name) if record else None
+    if source is None:
+        raise fault(SERVICE, 404, "Object not found.")
+    destination = request.headers.get("Destination")
+    if not destination:
+        raise fault(SERVICE, 412, "The COPY method requires a Destination header.")
+    return await _copy(session, project_id, source, destination, request)
+
+
+async def _bulk_delete(
+    request: Request, session: AsyncSession, project_id: str
+) -> Response:
+    """``?bulk-delete=1`` with one ``/container/object`` per line in the body.
+
+    The reason this exists is round trips: deleting ten thousand objects one request at
+    a time is the slowest thing a client can do to an object store. Swift answers with a
+    summary rather than a status code per line, so a partial failure still returns 200.
+    """
+    body = (await request.body()).decode(errors="replace")
+    targets = [line.strip() for line in body.splitlines() if line.strip()]
+    deleted, not_found, errors = 0, 0, []
+    for target in targets:
+        container_name, _, object_name = target.lstrip("/").partition("/")
+        record = await _container(session, project_id, container_name)
+        obj = await _object(session, record, object_name) if record else None
+        if obj is None:
+            not_found += 1
+            errors.append([target, "404 Not Found"])
+            continue
+        await session.delete(obj)
+        deleted += 1
+    await session.commit()
+    return JSONResponse(
+        {
+            "Number Deleted": deleted,
+            "Number Not Found": not_found,
+            "Response Status": "200 OK" if not errors else "400 Bad Request",
+            "Response Body": "",
+            "Errors": errors,
+        },
+        status_code=200,
+    )
