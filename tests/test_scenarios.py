@@ -180,3 +180,24 @@ async def test_scenarios_show_up_on_the_dashboard(api) -> None:
     stats = (await api["dashboard"].get("/api/stats")).json()
     assert len(stats["scenarios"]) == 1
     assert stats["scenarios"][0]["service"] == "cinder"
+
+
+async def test_the_catalog_skips_services_this_run_is_not_serving() -> None:
+    """--service narrows PORTS, and the catalog must narrow with it.
+
+    Advertising an endpoint for a service that is not running used to raise KeyError
+    inside token issuance, so every request in a narrowed run failed with a 500 -- the
+    run was unusable rather than partial.
+    """
+    from app.core.config import PORTS, build_catalog
+
+    full = {entry["name"] for entry in build_catalog("p1")}
+    assert "swift" in full
+
+    removed = PORTS.pop("swift")
+    try:
+        narrowed = {entry["name"] for entry in build_catalog("p1")}
+    finally:
+        PORTS["swift"] = removed
+    assert "swift" not in narrowed
+    assert "nova" in narrowed

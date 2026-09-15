@@ -262,6 +262,11 @@ def build_catalog(project_id: str) -> list[dict[str, Any]]:
     """Full Keystone v3 service catalog pointing at the loopback simulator ports."""
     catalog: list[dict[str, Any]] = []
     for service_key, ctype, cname, suffix in CATALOG_LAYOUT:
+        # --service narrows PORTS, and a catalog cannot advertise an endpoint for a
+        # service this run is not serving. Advertising it anyway used to fail token
+        # issuance outright, which made a narrowed run unusable rather than partial.
+        if service_key not in PORTS:
+            continue
         url = service_url(service_key, suffix % {"project_id": project_id})
         endpoints = [
             {

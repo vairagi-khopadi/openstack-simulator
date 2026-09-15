@@ -173,7 +173,10 @@ async def seed_catalog(session: AsyncSession) -> None:
                 id=deterministic_id(f"service-{cname}"),
                 type=ctype,
                 name=cname,
-                description=f"Simulated {ctype} service on port {PORTS[service_key]}",
+                description=(
+                    f"Simulated {ctype} service on port "
+                    f"{PORTS.get(service_key, 'not in this run')}"
+                ),
             )
             session.add(service)
             await session.flush()

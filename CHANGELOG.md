@@ -116,6 +116,13 @@ Two numbers move independently:
 - Startup warns when the chosen database has no identity seeded yet, naming the
   `seed.py --database …` command, instead of leaving every request to fail with `401`.
 
+### Fixed
+
+- `--service` no longer breaks token issuance. Narrowing a run removes entries from
+  `PORTS`, but the service catalog still advertised every service and raised
+  `KeyError` inside `build_catalog`, so every authenticated request in a narrowed run
+  failed with a `500`. The catalog now lists only the services actually being served.
+
 ### Changed
 
 - Quota endpoints no longer restate the node's capacity. `os-quota-sets` used to return
