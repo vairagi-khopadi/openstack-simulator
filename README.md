@@ -28,8 +28,10 @@ volumes, load balancers and on-the-fly rating](docs/dashboard.png)
 | **Failure injection** | 500s, 503s, 429s, latency, timeouts and quota exhaustion on demand |
 | **On-the-fly billing** | CloudKitty rating computed from SQL aggregates, no collector |
 | **Live dashboard** | Capacity meters, instance states, volumes, LBs and cost on port 10000 |
+| **Real microversions** | The version header is negotiated and acted on, not echoed back |
+| **Enforced quotas** | Per-project limits that bind before the hardware does |
 | **Persistent state** | SQLite across restarts — or delete the file to start over |
-| **In-process test suite** | 368 tests, no ports bound, fresh schema per test |
+| **In-process test suite** | 727 tests, no ports bound, fresh schema per test |
 
 ## Quick start
 
@@ -129,15 +131,15 @@ names the command that fixes it.
 
 | Service | Port | Base path | Notes |
 | --- | --- | --- | --- |
-| Keystone | 5000 | `/v3` | UUID tokens via `X-Subject-Token`, full 10-service catalog |
-| Nova | 8774 | `/v2.1` | servers, flavors, keypairs, hypervisors, diagnostics, console |
-| Cinder | 8776 | `/v3/{project_id}` | volumes, types, snapshots, attachments (`/v3/...` also works) |
-| Glance | 9292 | `/v2` | image catalog; uploads are hashed and discarded |
-| Neutron | 9696 | `/v2.0` | networks, subnets, ports, security groups, floating IPs |
-| Placement | 8778 | `/` | resource providers, inventories, usages, allocations |
-| Octavia | 9876 | `/v2/lbaas` | load balancers, listeners, pools, members, monitors |
-| Swift | 8080 | `/v1/AUTH_{project}` | containers + object metadata; bodies discarded |
-| CloudKitty | 8889 | `/v1` | rating computed per request from SQL aggregates |
+| Keystone | 5000 | `/v3` | UUID tokens via `X-Subject-Token`, projects, users, roles, groups, application credentials |
+| Nova | 8774 | `/v2.1` | servers, flavors, keypairs, hypervisors, diagnostics, console, server groups, interfaces, tags |
+| Cinder | 8776 | `/v3/{project_id}` | volumes, types, snapshots, attachments, backups, transfers, metadata (`/v3/...` also works) |
+| Glance | 9292 | `/v2` | image catalog, import workflow + tasks, tags, member sharing; uploads are hashed and discarded |
+| Neutron | 9696 | `/v2.0` | networks, subnets, ports, routers, security groups, floating IPs, trunks, subnet pools |
+| Placement | 8778 | `/` | resource providers, inventories, usages, allocations, traits, aggregates |
+| Octavia | 9876 | `/v2/lbaas` | load balancers, listeners, pools, members, monitors, L7 policies + rules, statistics |
+| Swift | 8080 | `/v1/AUTH_{project}` | containers + object metadata, bulk delete, COPY, expiry; bodies discarded |
+| CloudKitty | 8889 | `/v1` | rating computed per request from SQL aggregates, configurable via the hashmap module |
 | Scenarios | 8999 | `/v1/scenarios` | failure injection control plane |
 | Dashboard | 10000 | `/` | live capacity bars, instances, volumes, LBs, billing |
 
@@ -268,7 +270,7 @@ deployment it never gets the chance:
 Swift's HTML is canned per status code and has no room for a message, exactly as upstream.
 The simulator's own explanation is kept on an `X-OpenStack-Simulator-Detail` header.
 
-## The four operating principles
+## The operating principles
 
 **Stateless polling delays.** No worker threads, no background jobs. Creating a resource
 stores a `transition_until` timestamp 10–60 s in the future. While `now() < transition_until`
@@ -299,7 +301,9 @@ exactly what the real cloud would send it.
 `<collection>_links` (Glance: a flat `next`) while more remain, so an SDK paging through
 a collection terminates on a short page instead of re-reading page one forever. Paging is
 keyset-based, so it stays correct when resources are created or deleted mid-walk, and an
-unknown marker is a `400` rather than a silently empty page.
+unknown marker is a `400` rather than a silently empty page. `?sort_key=` / `?sort_dir=`
+compose with it — the keyset seeks on whichever column the sort uses — and Neutron
+listings honour `?fields=`.
 
 ## Quotas
 
@@ -476,13 +480,15 @@ app/api/        one module per service, each exporting a `router`
 app/static/     dashboard markup and client script (plain files, no template engine:
                 the page has no server-side variables -- it renders itself from /api/stats)
 app/core/       config (specs, ratios, rates), async engine, middleware + app factory,
-                schema versioning and migrations
+                schema versioning, microversion negotiation, marker pagination
 app/models/     typed SQLAlchemy 2.0 models
-app/services/   capacity (depletion), telemetry (diagnostics/console), rating (billing)
+app/services/   capacity (depletion), quotas (per-project limits), telemetry
+                (diagnostics/console), rating (billing), networking (IPAM)
 main.py         runs every service on one asyncio loop
 seed.py         idempotent seeder (`--reset` to start over)
 tests/          pytest suite (unit + per-service API tests), in-process via httpx
 CHANGELOG.md    what changed in each release, and which schema version it ships
+docs/gaps.md    what real OpenStack has that this does not, and what is out of scope
 ```
 
 ## Limitations
@@ -515,12 +521,11 @@ Worth knowing before you trust it for something:
   Nova to generate one returns synthetic material. There is no VM to log in to either way.
 - **Not for exposure.** Plain HTTP, tokens that are opaque UUIDs rather than Fernet, and
   a seeded password of `secret`. Bind it to loopback and keep it there.
-- **Whole API families are still missing** inside the services that are simulated —
-  notably Cinder backups and volume metadata, Glance's image-import workflow and
-  metadefs, Neutron trunks/QoS/subnet pools, Octavia L7 policies and statistics, Nova
-  server groups and aggregates, Keystone groups and application credentials, Placement
-  writes, and CloudKitty's whole hashmap rate-configuration surface. `docs/gaps.md` has
-  the list, with what has since been closed marked as such.
+- **Some API families are still missing** inside the services that are simulated —
+  Nova host aggregates, migrations and remote consoles; Neutron QoS, FWaaS and agents;
+  Glance metadefs; Cinder consistency groups and QoS specs; Octavia amphorae and
+  failover; Swift large objects and temp URLs; CloudKitty's v2 API. `docs/gaps.md` tracks
+  all of it, marking what has been closed and what is deliberately out of scope.
 - **Services not simulated:** Heat, Barbican, Magnum, Manila, Ironic, Designate, Ceilometer.
 
 ## License
