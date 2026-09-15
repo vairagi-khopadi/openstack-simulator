@@ -489,6 +489,7 @@ seed.py         idempotent seeder (`--reset` to start over)
 tests/          pytest suite (unit + per-service API tests), in-process via httpx
 CHANGELOG.md    what changed in each release, and which schema version it ships
 docs/gaps.md    what real OpenStack has that this does not, and what is out of scope
+docs/roadmap.md the phased plan, what is left, and the open design questions
 ```
 
 ## Limitations
@@ -525,7 +526,8 @@ Worth knowing before you trust it for something:
   Nova host aggregates, migrations and remote consoles; Neutron QoS, FWaaS and agents;
   Glance metadefs; Cinder consistency groups and QoS specs; Octavia amphorae and
   failover; Swift large objects and temp URLs; CloudKitty's v2 API. `docs/gaps.md` tracks
-  all of it, marking what has been closed and what is deliberately out of scope.
+  all of it, marking what has been closed and what is deliberately out of scope;
+  `docs/roadmap.md` has the plan and the open design questions.
 - **Services not simulated:** Heat, Barbican, Magnum, Manila, Ironic, Designate, Ceilometer.
 
 ## License

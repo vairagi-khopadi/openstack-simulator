@@ -7,7 +7,10 @@ describes routes that exist rather than features that were intended.
 The point of the list is to be honest about the edges: code written against the simulator
 should fail here, in a way you can see, rather than on a real cloud later.
 
-Status key: **done** · **next** · *(no marker)* not started.
+Status key: **done** · *(no marker)* not started.
+
+`docs/roadmap.md` is the companion: which phase each group of work belongs to, what is
+left, and the open questions that block parts of it.
 
 ---
 
