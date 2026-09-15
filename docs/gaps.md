@@ -25,19 +25,23 @@ These affected every service and are now implemented.
   (Glance's flat `next`/`first`), keyset-based, on every major collection. See
   `app/core/pagination.py`.
 
-Still open, cross-cutting:
-
 - **done** — Sorting. `?sort_key=` / `?sort_dir=` on every paginated listing, resolved
   against the model with an unknown key ignored rather than refused. The marker keyset
   seeks on the sorted column, so sorting and pagination compose.
 - **done** — Field selection. `?fields=` trims Neutron listings (comma-separated or
   repeated), always keeping `id`.
-- **Tags.** No tags API on any resource — Neutron resource tags, Nova server tags
-  (`/servers/{id}/tags`), Glance image tags.
+- **done** — Nova server tags (`/servers/{id}/tags`) and Glance image tags
+  (`/v2/images/{id}/tags/{tag}`).
+
+Still open, cross-cutting:
+
+- **Neutron resource tags.** `/v2.0/networks/{id}/tags` and the same on every other
+  Neutron resource. Nova's and Glance's exist; Neutron's do not.
 - **Unified limits.** Keystone `/v3/limits` and `/v3/registered_limits`, the modern
   replacement for per-service quota APIs.
 - **RBAC.** Project isolation is modelled; per-role authorisation is not. A `reader`
-  token can do anything a `member` can inside its own project.
+  token can do anything a `member` can inside its own project. Needs a design decision
+  before implementation — it touches every handler rather than adding endpoints.
 
 ---
 
