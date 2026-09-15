@@ -158,9 +158,13 @@ POST · container ACLs and sync · `COPY` · expiring objects (`X-Delete-After`)
 
 ### CloudKitty
 
-The entire rate-configuration surface: `/v1/rating/module_config/hashmap/*` (services,
-fields, mappings, thresholds, groups) and the pyscripts module — so rates are settable
-only through `OPENSTACK_SIMULATOR_RATE_*` environment variables. No v2 API
+**done** — The hashmap rate-configuration surface
+(`/v1/rating/module_config/hashmap/{services,fields,mappings,thresholds,groups}`), and
+service-level mappings actually reprice the bill: `flat` adds per unit, `rate` multiplies.
+Nothing configured leaves billing exactly as it was.
+
+Still open: field-level mappings and thresholds are stored and served but not yet applied
+during rating (only service-level mappings are) · the pyscripts module · the v2 API
 (`/v2/summary`, `/v2/dataframes`, scope state).
 
 ---

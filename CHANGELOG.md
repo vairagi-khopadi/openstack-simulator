@@ -23,6 +23,12 @@ Two numbers move independently:
   `trusted_image_certificates` (2.63) and `server_groups` (2.71), embeds the flavor only
   from 2.47, and `os-quota-sets` drops the network quotas at 2.36 and the personality-file
   quotas at 2.57.
+- **CloudKitty hashmap configuration**
+  (`/v1/rating/module_config/hashmap/...`): services, fields, mappings, thresholds and
+  groups, so rates no longer require a restart and an `OPENSTACK_SIMULATOR_RATE_*`
+  variable. Service-level mappings are applied during rating — `flat` adds per unit of
+  quantity, `rate` multiplies what the built-in rates produced — and a cloud that never
+  touches the API bills exactly as before.
 - **Placement writes**: custom traits, provider traits and aggregates, and custom
   resource classes — with the `CUSTOM_` namespace enforced, standard names protected from
   deletion, and a trait still set on a provider refusing to be deleted. Resource provider

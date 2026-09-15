@@ -14,6 +14,7 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.config import iso, now_utc, settings
 from app.models.compute import Server
+from app.models.rating import HashMapEntry
 from app.models.loadbalancer import LoadBalancer
 from app.models.network import FloatingIP
 from app.models.objectstore import ObjectMetadata
@@ -163,6 +164,69 @@ async def _aged_rows(
     return rows
 
 
+# CloudKitty's hashmap service names, mapped onto this module's line-item types. A rule
+# configured against "compute" has to find the rows it is meant to reprice.
+_HASHMAP_SERVICES: dict[str, tuple[str, ...]] = {
+    "compute": (RES_INSTANCE, RES_INSTANCE_IDLE),
+    "instance": (RES_INSTANCE, RES_INSTANCE_IDLE),
+    "volume": (RES_VOLUME,),
+    "volume.size": (RES_VOLUME,),
+    "network.floating": (RES_FLOATING_IP,),
+    "loadbalancer": (RES_LOADBALANCER,),
+    "object": (RES_OBJECT,),
+    "image": (),
+}
+
+
+async def _apply_hashmap(
+    session: AsyncSession, rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Reprice line items according to the configured hashmap rules.
+
+    Rules attached to a *service* apply to every line item of the types that service
+    covers. ``flat`` adds its cost per unit of quantity; ``rate`` multiplies what the
+    built-in rates already produced -- which is how an operator applies a discount or a
+    surcharge without restating every price.
+
+    Nothing configured means nothing changes, so a cloud that never touches the hashmap
+    API bills exactly as it did before.
+    """
+    services = (
+        await session.execute(
+            select(HashMapEntry).where(HashMapEntry.kind == "service")
+        )
+    ).scalars().all()
+    if not services:
+        return rows
+
+    by_id = {service.id: service for service in services}
+    mappings = (
+        await session.execute(
+            select(HashMapEntry).where(
+                HashMapEntry.kind == "mapping",
+                HashMapEntry.parent_id.in_(list(by_id) or [""]),
+            )
+        )
+    ).scalars().all()
+    if not mappings:
+        return rows
+
+    for row in rows:
+        for mapping in mappings:
+            service = by_id.get(mapping.parent_id or "")
+            if service is None:
+                continue
+            if row["res_type"] not in _HASHMAP_SERVICES.get(service.name or "", ()):
+                continue
+            if mapping.project_id and mapping.project_id != row["tenant_id"]:
+                continue
+            if mapping.map_type == "rate":
+                row["rate"] = round(row["rate"] * mapping.cost, 6)
+            else:
+                row["rate"] = round(row["rate"] + row["qty"] * mapping.cost, 6)
+    return rows
+
+
 async def collect(
     session: AsyncSession, project_id: str | None = None
 ) -> list[dict[str, Any]]:
@@ -205,7 +269,7 @@ async def collect(
         settings.rate_object_gb_hour,
         [],
     )
-    return rows
+    return await _apply_hashmap(session, rows)
 
 
 async def summary(

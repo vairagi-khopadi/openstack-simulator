@@ -45,6 +45,7 @@ from app.models.network import (
     SubnetPool,
     Trunk,
 )
+from app.models.rating import KINDS, MAP_TYPES, HashMapEntry
 from app.models.objectstore import Container, ObjectMetadata, SwiftAccount
 from app.models.quota import UNLIMITED, Quota
 from app.models.storage import (
@@ -66,6 +67,8 @@ __all__ = [
     "VOLUME_STATES_HOLDING_DISK",
     "VALID_ACTIONS",
     "UNLIMITED",
+    "KINDS",
+    "MAP_TYPES",
     "VALID_SERVICES",
     "ApplicationCredential",
     "Backup",
@@ -77,6 +80,7 @@ __all__ = [
     "HealthMonitor",
     "Group",
     "GroupMembership",
+    "HashMapEntry",
     "Hypervisor",
     "Image",
     "ImageMember",
