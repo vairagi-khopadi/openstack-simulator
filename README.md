@@ -67,6 +67,7 @@ Ctrl-C stops all eleven services. To run it in the background instead:
 | `main.py --help` | all of the above |
 | `seed.py --reset` | rebuild the node, identity, catalog, flavors, images, networks |
 | `seed.py --database dev.db` (`-D`) | seed that environment instead of the default one |
+| `seed.py --seed-data mycloud.json` (`-S`) | take the flavor and image lists from a JSON file |
 
 `--detach` re-execs the entry point in its own session, so closing the terminal or
 Ctrl-C'ing the shell that launched it leaves the simulator running. It does not return
@@ -126,6 +127,41 @@ behaves exactly as before.
 A database that exists but was never seeded has no admin user, so every request would
 come back `401`. Rather than let that look like a broken simulator, startup says so and
 names the command that fixes it.
+
+## Your own flavors and images
+
+`--seed-data` (`-S`) points the seeder at a JSON file and uses the lists in it instead of
+the built-in `m1.*` flavors and cirros/ubuntu images:
+
+```json
+{
+  "flavors": [
+    {"id": "10", "name": "c1.large", "vcpus": 8, "ram": 16384, "disk": 100},
+    {"id": "11", "name": "c1.xlarge", "vcpus": 16, "ram": 32768, "disk": 200,
+     "extra_specs": {"hw:numa_nodes": "2"}}
+  ],
+  "images": [
+    {"name": "debian-12", "min_ram": 512, "min_disk": 10, "size": 350000000,
+     "disk_format": "qcow2", "properties": {"os_distro": "debian"}}
+  ]
+}
+```
+
+```bash
+.venv/bin/python seed.py --reset --seed-data mycloud.json
+```
+
+A section you leave out keeps its built-in list, so a file with only `images` still gets
+`m1.tiny` and friends; `"flavors": []` seeds none at all. A flavor needs `name`, `vcpus`,
+`ram` and `disk`, and may also carry `id`, `ephemeral`, `swap`, `rxtx_factor`,
+`is_public`, `disabled`, `description` and `extra_specs`. An image needs `name`,
+`min_ram`, `min_disk`, `size` and `disk_format`, and may carry `properties`; its id and
+checksums are derived from its name, so they are stable across reseeds.
+
+The whole file is checked before the first row is written — an unknown key, a missing
+one, a wrong type or a repeated name is reported with the entry that caused it and
+nothing is seeded. Both lists are matched by name, so adding an entry and rerunning
+without `--reset` tops it up rather than duplicating anything.
 
 ## Services
 
@@ -485,7 +521,8 @@ app/models/     typed SQLAlchemy 2.0 models
 app/services/   capacity (depletion), quotas (per-project limits), telemetry
                 (diagnostics/console), rating (billing), networking (IPAM)
 main.py         runs every service on one asyncio loop
-seed.py         idempotent seeder (`--reset` to start over)
+seed.py         idempotent seeder (`--reset` to start over, `--seed-data` for your own
+                flavors and images)
 tests/          pytest suite (unit + per-service API tests), in-process via httpx
 CHANGELOG.md    what changed in each release, and which schema version it ships
 docs/gaps.md    what real OpenStack has that this does not, and what is out of scope

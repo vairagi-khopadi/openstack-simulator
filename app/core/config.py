@@ -2,6 +2,7 @@
 service catalog layout and small shared helpers (time, ids, transition windows)."""
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 import re
@@ -323,6 +324,19 @@ def gen_id() -> str:
 
 def deterministic_id(seed: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
+
+
+def deterministic_hashes(seed: str) -> tuple[str, str]:
+    """(md5, sha512) hex digests for an image whose bytes were never stored.
+
+    Glance here hashes an upload as it streams past and then drops it, so an image ends
+    up with digests but no data. A seeded image has no upload to hash at all, and null
+    checksums are the one field that reads as obviously simulated. Hashing the seed
+    string gives it the well-formed, stable pair a real catalog carries -- both digests
+    over the same stand-in, not over ``size`` bytes of anything.
+    """
+    payload = seed.encode()
+    return hashlib.md5(payload).hexdigest(), hashlib.sha512(payload).hexdigest()
 
 
 def gen_token() -> str:

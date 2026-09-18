@@ -2,12 +2,15 @@
 networks and a default security group.
 
 Idempotent -- rerunning tops up anything missing. ``--reset`` starts from scratch.
+``--seed-data`` swaps the built-in flavor and image lists for ones read from a JSON file.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
@@ -18,6 +21,7 @@ from app.core.config import (
     DOMAIN_ID,
     PORTS,
     database_label,
+    deterministic_hashes,
     deterministic_id,
     gen_id,
     service_url,
@@ -60,6 +64,107 @@ IMAGES: list[dict[str, Any]] = [
 ]
 
 ROLES = ("admin", "member", "reader")
+
+# --------------------------------------------------------------------------------------
+# --seed-data: flavors and images from a JSON file
+# --------------------------------------------------------------------------------------
+# The file is an object with a "flavors" and/or an "images" key, each a list of the same
+# shape as the literals above:
+#
+#   {"flavors": [{"id": "4", "name": "m1.large", "vcpus": 4, "ram": 8192, "disk": 80}],
+#    "images":  [{"name": "debian-12", "min_ram": 512, "min_disk": 10, "size": 1024,
+#                 "disk_format": "qcow2", "properties": {"os_distro": "debian"}}]}
+#
+# A key that is present REPLACES that built-in list -- so a file with only "images" keeps
+# m1.tiny and friends, and "flavors": [] seeds no flavors at all. Everything is checked
+# before the first row is written, because a bad key would otherwise surface as a
+# TypeError halfway through a transaction.
+
+FLAVOR_FIELDS: dict[str, type | tuple[type, ...]] = {
+    "id": str, "name": str, "vcpus": int, "ram": int, "disk": int, "ephemeral": int,
+    "swap": int, "rxtx_factor": (int, float), "is_public": bool, "disabled": bool,
+    "description": str, "extra_specs": dict,
+}
+FLAVOR_REQUIRED = ("name", "vcpus", "ram", "disk")
+
+IMAGE_FIELDS: dict[str, type | tuple[type, ...]] = {
+    "name": str, "min_ram": int, "min_disk": int, "size": int, "disk_format": str,
+    "properties": dict,
+}
+IMAGE_REQUIRED = ("name", "min_ram", "min_disk", "size", "disk_format")
+
+
+def _check_specs(
+    specs: Any,
+    section: str,
+    fields: dict[str, type | tuple[type, ...]],
+    required: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """Validate one section of a --seed-data file, reporting the first thing wrong."""
+    if not isinstance(specs, list):
+        raise ValueError(f"{section!r} must be a list, not {type(specs).__name__}")
+    seen: set[str] = set()
+    for index, spec in enumerate(specs):
+        where = f"{section}[{index}]"
+        if not isinstance(spec, dict):
+            raise ValueError(f"{where} must be an object, not {type(spec).__name__}")
+        for key in required:
+            if key not in spec:
+                raise ValueError(f"{where} is missing {key!r}")
+        for key, value in spec.items():
+            if key not in fields:
+                raise ValueError(
+                    f"{where} has unknown key {key!r}; "
+                    f"allowed: {', '.join(sorted(fields))}"
+                )
+            # bool is an int subclass, so the second half keeps 'vcpus': true from
+            # passing as an integer -- and keeps 'is_public': 1 from passing as a bool.
+            expected = fields[key]
+            if not isinstance(value, expected) or isinstance(value, bool) != (expected is bool):
+                wanted = expected.__name__ if isinstance(expected, type) else "number"
+                raise ValueError(
+                    f"{where}[{key!r}] must be {wanted}, not {type(value).__name__}"
+                )
+        name = spec["name"]
+        if name in seen:
+            raise ValueError(f"{where} repeats the name {name!r}")
+        seen.add(name)
+    return specs
+
+
+SeedSpecs = list[dict[str, Any]] | None
+
+
+def load_seed_data(path: str | Path) -> tuple[SeedSpecs, SeedSpecs]:
+    """Read a --seed-data file into (flavors, images); None means 'keep the built-in list'.
+
+    Raises ``ValueError`` -- including for unreadable or malformed JSON -- with a message
+    naming the offending entry, so the caller can print it and exit rather than traceback.
+    """
+    try:
+        raw = Path(path).expanduser().read_text()
+    except OSError as exc:
+        raise ValueError(str(exc)) from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"top level must be an object with 'flavors' and/or 'images', "
+            f"not {type(data).__name__}"
+        )
+    unknown = set(data) - {"flavors", "images"}
+    if unknown:
+        raise ValueError(f"unknown top-level key(s): {', '.join(sorted(unknown))}")
+    if not data:
+        raise ValueError("no 'flavors' or 'images' key, so there is nothing to seed")
+    flavors = images = None
+    if "flavors" in data:
+        flavors = _check_specs(data["flavors"], "flavors", FLAVOR_FIELDS, FLAVOR_REQUIRED)
+    if "images" in data:
+        images = _check_specs(data["images"], "images", IMAGE_FIELDS, IMAGE_REQUIRED)
+    return flavors, images
 
 
 async def seed_host(session: AsyncSession) -> Hypervisor:
@@ -194,22 +299,26 @@ async def seed_catalog(session: AsyncSession) -> None:
             )
 
 
-async def seed_flavors(session: AsyncSession) -> None:
-    for spec in FLAVORS:
+async def seed_flavors(session: AsyncSession, specs: list[dict[str, Any]] = FLAVORS) -> None:
+    for spec in specs:
         existing = (
             await session.execute(select(Flavor).where(Flavor.name == spec["name"]))
         ).scalar_one_or_none()
         if existing is None:
-            session.add(Flavor(description=f"Simulated {spec['name']}", **spec))
+            # Spread second so a --seed-data entry can carry its own description.
+            session.add(Flavor(**{"description": f"Simulated {spec['name']}", **spec}))
 
 
-async def seed_images(session: AsyncSession, owner: str) -> None:
-    for spec in IMAGES:
+async def seed_images(
+    session: AsyncSession, owner: str, specs: list[dict[str, Any]] = IMAGES
+) -> None:
+    for spec in specs:
         existing = (
             await session.execute(select(Image).where(Image.name == spec["name"]))
         ).scalar_one_or_none()
         if existing is not None:
             continue
+        checksum, os_hash_value = deterministic_hashes(f"image-{spec['name']}")
         session.add(
             Image(
                 id=deterministic_id(f"image-{spec['name']}"),
@@ -223,7 +332,10 @@ async def seed_images(session: AsyncSession, owner: str) -> None:
                 min_disk=spec["min_disk"],
                 size=spec["size"],
                 virtual_size=spec["size"],
-                properties=spec["properties"],
+                checksum=checksum,
+                os_hash_algo="sha512",
+                os_hash_value=os_hash_value,
+                properties=spec.get("properties", {}),
             )
         )
 
@@ -354,14 +466,18 @@ async def seed_quotas(session: AsyncSession, project_id: str) -> None:
                 )
 
 
-async def seed(reset: bool = False) -> None:
+async def seed(
+    reset: bool = False, flavors: SeedSpecs = None, images: SeedSpecs = None
+) -> None:
+    flavors = FLAVORS if flavors is None else flavors
+    images = IMAGES if images is None else images
     schema = await init_db(drop=reset)
     async with SessionLocal() as session:
         host = await seed_host(session)
         project, user = await seed_identity(session)
         await seed_catalog(session)
-        await seed_flavors(session)
-        await seed_images(session, project.id)
+        await seed_flavors(session, flavors)
+        await seed_images(session, project.id, images)
         await seed_volume_types(session)
         await seed_networks(session, project.id)
         await seed_security_group(session, project.id)
@@ -378,14 +494,16 @@ async def seed(reset: bool = False) -> None:
               f" (+{settings.qemu_overhead_mb} MB per VM)")
         print(f"  project/user  {project.name}/{user.name} (password: {settings.admin_password})")
         print(f"  project id    {project.id}")
-        print(f"  flavors       {', '.join(f['name'] for f in FLAVORS)}")
-        print(f"  images        {', '.join(i['name'] for i in IMAGES)}")
+        print(f"  flavors       {', '.join(f['name'] for f in flavors) or '(none)'}")
+        print(f"  images        {', '.join(i['name'] for i in images) or '(none)'}")
         print(f"  networks      {settings.private_network_name} ({settings.private_network_cidr}), "
               f"{settings.external_network_name} ({settings.external_network_cidr})")
         print(f"  auth url      {service_url('keystone', '/v3')}")
 
 
-async def _seed_and_close(reset: bool = False) -> None:
+async def _seed_and_close(
+    reset: bool = False, flavors: SeedSpecs = None, images: SeedSpecs = None
+) -> None:
     """Seeding as a one-shot command: do the work, then let go of the engine.
 
     ``seed`` itself leaves the engine open, because ``main.py`` calls it in-process to
@@ -393,7 +511,7 @@ async def _seed_and_close(reset: bool = False) -> None:
     whole database lives in.
     """
     try:
-        await seed(reset=reset)
+        await seed(reset=reset, flavors=flavors, images=images)
     finally:
         await dispose_db()
 
@@ -413,11 +531,28 @@ def main(argv: list[str] | None = None) -> int:
              f"(default: {settings.database_url})",
     )
     parser.add_argument(
+        "--seed-data",
+        "-S",
+        metavar="PATH",
+        help="JSON file of flavors and/or images to seed instead of the built-in ones: "
+             '{"flavors": [{"name": "m1.large", "vcpus": 4, "ram": 8192, "disk": 80}], '
+             '"images": [{"name": "debian-12", "min_ram": 512, "min_disk": 10, '
+             '"size": 1024, "disk_format": "qcow2"}]}. A key you leave out keeps that '
+             "built-in list",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"OpenStack-Simulator {__version__} (database schema v{SCHEMA_VERSION})",
     )
     args = parser.parse_args(argv)
+    flavors = images = None
+    if args.seed_data:
+        try:
+            flavors, images = load_seed_data(args.seed_data)
+        except ValueError as exc:
+            print(f"Cannot use seed data {args.seed_data!r}: {exc}", file=sys.stderr)
+            return 1
     if args.database:
         try:
             use_database(args.database)
@@ -425,7 +560,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Cannot use database {args.database!r}: {exc}", file=sys.stderr)
             return 1
     try:
-        asyncio.run(_seed_and_close(reset=args.reset))
+        asyncio.run(_seed_and_close(reset=args.reset, flavors=flavors, images=images))
     except SchemaVersionError as exc:
         print(f"\n{exc}\n", file=sys.stderr)
         return 1

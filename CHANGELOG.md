@@ -15,6 +15,15 @@ Two numbers move independently:
 
 ### Added
 
+- **`seed.py --seed-data PATH` (`-S`)** takes the flavor and image lists from a JSON file
+  instead of the built-in `m1.*` / cirros lists. A section left out of the file keeps its
+  built-in list, `[]` seeds none, and the whole file — unknown keys, missing required
+  ones, wrong types, repeated names — is validated before the first row is written, so a
+  typo fails with the offending entry named rather than as a `TypeError` mid-transaction.
+- **Seeded images carry checksums.** `checksum`, `os_hash_algo` and `os_hash_value` are
+  derived from the image name, so the shipped catalog no longer hands out null digests
+  where a real Glance has them. The digests cover a stand-in, not `size` bytes of data.
+
 - **Microversion negotiation is real.** `OpenStack-API-Version` (and novaclient's
   `X-OpenStack-Nova-API-Version`) is parsed and validated, `latest` is understood, the
   response reports the version actually served, an unsupported version returns `406` and

@@ -28,6 +28,10 @@ async def test_seeded_images(api) -> None:
     assert images["ubuntu-24.04"]["min_ram"] == 2048
     assert images["cirros"]["status"] == "active"
     assert images["cirros"]["os_distro"] == "cirros", "custom properties are flattened"
+    for image in images.values():
+        assert image["os_hash_algo"] == "sha512"
+        assert len(image["checksum"]) == 32 and len(image["os_hash_value"]) == 128
+    assert images["cirros"]["checksum"] != images["ubuntu-24.04"]["checksum"]
 
 
 async def test_image_create_starts_queued(api, cloud) -> None:
