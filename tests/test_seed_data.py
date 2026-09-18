@@ -77,6 +77,26 @@ async def test_optional_fields_are_accepted(tmp_path: Path) -> None:
     assert flavors == [spec]
 
 
+async def test_one_file_per_list(tmp_path: Path) -> None:
+    """The two lists are allowed to live in a file each, as seed-data/ ships them."""
+    one = tmp_path / "flavors.json"
+    two = tmp_path / "images.json"
+    one.write_text(json.dumps({"flavors": [FLAVOR]}))
+    two.write_text(json.dumps({"images": [IMAGE]}))
+    flavors, images = seed_module.load_seed_files([one, two])
+    assert flavors == [FLAVOR]
+    assert images == [IMAGE]
+
+
+async def test_shipped_seed_data_files_are_valid() -> None:
+    """The files in seed-data/ must not drift out of what the loader accepts."""
+    directory = Path(__file__).resolve().parent.parent / "seed-data"
+    paths = sorted(directory.glob("*.json"))
+    assert paths, "seed-data/ should ship at least one example"
+    flavors, images = seed_module.load_seed_files(list(paths))
+    assert flavors and images
+
+
 async def test_home_relative_path_is_expanded(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     _write(tmp_path, {"images": [IMAGE]})
@@ -113,6 +133,15 @@ async def test_bad_file_is_rejected(tmp_path: Path, data: Any, message: str) -> 
         seed_module.load_seed_data(_write(tmp_path, data))
 
 
+async def test_a_section_may_only_be_given_once(tmp_path: Path) -> None:
+    one = tmp_path / "a.json"
+    two = tmp_path / "b.json"
+    one.write_text(json.dumps({"images": [IMAGE]}))
+    two.write_text(json.dumps({"images": [{**IMAGE, "name": "other"}]}))
+    with pytest.raises(ValueError, match="was already given in"):
+        seed_module.load_seed_files([one, two])
+
+
 async def test_malformed_json_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="not valid JSON"):
         seed_module.load_seed_data(_write(tmp_path, "{not json"))
@@ -146,6 +175,23 @@ async def test_seeding_custom_specs_writes_them() -> None:
     assert images[0].owner == project_id and images[0].status == "active"
     assert images[0].properties == {}, "properties is optional in a --seed-data file"
     assert len(images[0].checksum) == 32 and images[0].os_hash_algo == "sha512"
+
+
+async def test_supplied_image_id_is_kept() -> None:
+    """A portal sends the id its own cloud gave the image, so the file can pin it."""
+    uuid = "e5a9facb-1cdb-4430-8377-2fffa7cc2aca"
+    async with SessionLocal() as session:
+        project, _ = await seed_module.seed_identity(session)
+        await seed_module.seed_images(
+            session, project.id, [{**IMAGE, "id": uuid}, {**IMAGE, "name": "derived"}]
+        )
+        await session.commit()
+        images = {
+            i.name: i.id
+            for i in (await session.execute(select(Image))).scalars().all()
+        }
+    assert images["debian-12"] == uuid
+    assert images["derived"] != uuid and len(images["derived"]) == 36
 
 
 async def test_supplied_description_wins() -> None:

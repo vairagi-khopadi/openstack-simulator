@@ -20,6 +20,11 @@ Two numbers move independently:
   built-in list, `[]` seeds none, and the whole file — unknown keys, missing required
   ones, wrong types, repeated names — is validated before the first row is written, so a
   typo fails with the offending entry named rather than as a `TypeError` mid-transaction.
+  The flag is repeatable, so the two lists can live in a file each; giving the same
+  section twice is an error. An image entry may pin its `id`, which is what a portal
+  sends, instead of taking the one derived from its name.
+- **`seed-data/`** ships a worked example: `dev-flavors.json` and `dev-images.json`,
+  the flavor and image catalog of a dev cloud fronted by a portal.
 - **Seeded images carry checksums.** `checksum`, `os_hash_algo` and `os_hash_value` are
   derived from the image name, so the shipped catalog no longer hands out null digests
   where a real Glance has them. The digests cover a stand-in, not `size` bytes of data.

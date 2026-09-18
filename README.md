@@ -151,17 +151,33 @@ the built-in `m1.*` flavors and cirros/ubuntu images:
 .venv/bin/python seed.py --reset --seed-data mycloud.json
 ```
 
+The flag is repeatable, so the two lists can live in a file each — which is how the
+examples in `seed-data/` are laid out:
+
+```bash
+.venv/bin/python seed.py --reset -S seed-data/dev-flavors.json -S seed-data/dev-images.json
+```
+
 A section you leave out keeps its built-in list, so a file with only `images` still gets
-`m1.tiny` and friends; `"flavors": []` seeds none at all. A flavor needs `name`, `vcpus`,
-`ram` and `disk`, and may also carry `id`, `ephemeral`, `swap`, `rxtx_factor`,
-`is_public`, `disabled`, `description` and `extra_specs`. An image needs `name`,
-`min_ram`, `min_disk`, `size` and `disk_format`, and may carry `properties`; its id and
-checksums are derived from its name, so they are stable across reseeds.
+`m1.tiny` and friends; `"flavors": []` seeds none at all. Giving the same section twice
+across several files is an error rather than a merge.
+
+A flavor needs `name`, `vcpus`, `ram` and `disk`, and may also carry `id`, `ephemeral`,
+`swap`, `rxtx_factor`, `is_public`, `disabled`, `description` and `extra_specs`. An image
+needs `name`, `min_ram`, `min_disk`, `size` and `disk_format`, and may carry `id` and
+`properties`. An image `id` is worth setting when you are mirroring a real cloud, because
+that is the id a portal sends; left out, it is derived from the name, as the checksums
+always are, so both are stable across reseeds.
 
 The whole file is checked before the first row is written — an unknown key, a missing
 one, a wrong type or a repeated name is reported with the entry that caused it and
-nothing is seeded. Both lists are matched by name, so adding an entry and rerunning
-without `--reset` tops it up rather than duplicating anything.
+nothing is seeded.
+
+Both lists are matched by **name**, so adding an entry and rerunning without `--reset`
+tops it up rather than duplicating anything. The same rule is a trap when a file replaces
+a built-in of the same name: seeding `ubuntu-24.04` into a database that already has the
+shipped `ubuntu-24.04` keeps the existing row, id and all, and the id in your file is
+ignored. Use `--reset` when the lists are meant to replace rather than extend.
 
 ## Services
 

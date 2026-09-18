@@ -88,8 +88,8 @@ FLAVOR_FIELDS: dict[str, type | tuple[type, ...]] = {
 FLAVOR_REQUIRED = ("name", "vcpus", "ram", "disk")
 
 IMAGE_FIELDS: dict[str, type | tuple[type, ...]] = {
-    "name": str, "min_ram": int, "min_disk": int, "size": int, "disk_format": str,
-    "properties": dict,
+    "id": str, "name": str, "min_ram": int, "min_disk": int, "size": int,
+    "disk_format": str, "properties": dict,
 }
 IMAGE_REQUIRED = ("name", "min_ram", "min_disk", "size", "disk_format")
 
@@ -164,6 +164,30 @@ def load_seed_data(path: str | Path) -> tuple[SeedSpecs, SeedSpecs]:
         flavors = _check_specs(data["flavors"], "flavors", FLAVOR_FIELDS, FLAVOR_REQUIRED)
     if "images" in data:
         images = _check_specs(data["images"], "images", IMAGE_FIELDS, IMAGE_REQUIRED)
+    return flavors, images
+
+
+def load_seed_files(paths: list[str | Path]) -> tuple[SeedSpecs, SeedSpecs]:
+    """Read several --seed-data files, so flavors and images can live in one file each.
+
+    A section may only be given once across the whole set: two files that both carry
+    "images" is a mistake worth reporting, not a merge to guess at.
+    """
+    flavors = images = None
+    seen: dict[str, str | Path] = {}
+    for path in paths:
+        try:
+            new_flavors, new_images = load_seed_data(path)
+        except ValueError as exc:
+            raise ValueError(f"{path}: {exc}") from exc
+        for section, value in (("flavors", new_flavors), ("images", new_images)):
+            if value is None:
+                continue
+            if section in seen:
+                raise ValueError(f"{path}: {section!r} was already given in {seen[section]}")
+            seen[section] = path
+        flavors = new_flavors if new_flavors is not None else flavors
+        images = new_images if new_images is not None else images
     return flavors, images
 
 
@@ -321,7 +345,9 @@ async def seed_images(
         checksum, os_hash_value = deterministic_hashes(f"image-{spec['name']}")
         session.add(
             Image(
-                id=deterministic_id(f"image-{spec['name']}"),
+                # A --seed-data entry may carry the id the real cloud gave the image,
+                # which is what a portal sends; otherwise it is derived from the name.
+                id=spec.get("id") or deterministic_id(f"image-{spec['name']}"),
                 name=spec["name"],
                 owner=owner,
                 status="active",
@@ -534,11 +560,12 @@ def main(argv: list[str] | None = None) -> int:
         "--seed-data",
         "-S",
         metavar="PATH",
+        action="append",
         help="JSON file of flavors and/or images to seed instead of the built-in ones: "
              '{"flavors": [{"name": "m1.large", "vcpus": 4, "ram": 8192, "disk": 80}], '
              '"images": [{"name": "debian-12", "min_ram": 512, "min_disk": 10, '
              '"size": 1024, "disk_format": "qcow2"}]}. A key you leave out keeps that '
-             "built-in list",
+             "built-in list. Repeatable, so the two lists can live in one file each",
     )
     parser.add_argument(
         "--version",
@@ -549,9 +576,9 @@ def main(argv: list[str] | None = None) -> int:
     flavors = images = None
     if args.seed_data:
         try:
-            flavors, images = load_seed_data(args.seed_data)
+            flavors, images = load_seed_files(args.seed_data)
         except ValueError as exc:
-            print(f"Cannot use seed data {args.seed_data!r}: {exc}", file=sys.stderr)
+            print(f"Cannot use seed data: {exc}", file=sys.stderr)
             return 1
     if args.database:
         try:
