@@ -39,14 +39,15 @@ from app.models.storage import Backup, Snapshot, Volume
 # Defaults
 # --------------------------------------------------------------------------------------
 
-# What a project gets with nothing stored for it. These are upstream's own defaults, not
-# this node's capacity: a quota that moved when you edited OPENSTACK_SIMULATOR_HOST_RAM_MB
-# would not be a quota. Capacity still applies on top, so the effective ceiling is
-# whichever is lower.
+# What a project gets with nothing stored for it. These are sized for the deployment this
+# cloud models -- ten VMs with a data volume each -- rather than copied from upstream, but
+# they are still policy and not this node's capacity: a quota that moved when you edited
+# OPENSTACK_SIMULATOR_HOST_RAM_MB would not be a quota. Capacity still applies on top, so
+# the effective ceiling is whichever is lower.
 NOVA_DEFAULTS: dict[str, int] = {
     "instances": 10,
     "cores": 20,
-    "ram": 51200,
+    "ram": 81920,
     "key_pairs": 100,
     "metadata_items": 128,
     "server_groups": 10,
@@ -54,9 +55,9 @@ NOVA_DEFAULTS: dict[str, int] = {
 }
 
 CINDER_DEFAULTS: dict[str, int] = {
-    "volumes": 10,
+    "volumes": 25,
     "snapshots": 10,
-    "gigabytes": 1000,
+    "gigabytes": 2000,
     "backups": 10,
     "backup_gigabytes": 1000,
     "per_volume_gigabytes": UNLIMITED,
@@ -66,9 +67,9 @@ CINDER_DEFAULTS: dict[str, int] = {
 NEUTRON_DEFAULTS: dict[str, int] = {
     "network": 100,
     "subnet": 100,
-    "port": 500,
+    "port": 60,
     "router": 10,
-    "floatingip": 50,
+    "floatingip": 15,
     "security_group": 10,
     "security_group_rule": 100,
     "rbac_policy": 10,

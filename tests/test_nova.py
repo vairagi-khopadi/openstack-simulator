@@ -508,14 +508,59 @@ async def test_hypervisor_endpoints(api, cloud) -> None:
     assert single["hypervisor"]["hypervisor_hostname"] == "node-01"
 
 
-async def test_limits_reflect_live_usage(api) -> None:
+async def test_limits_report_the_quota_not_the_node(api, cloud) -> None:
+    """`/limits` answers "how many more may I boot?", so it has to be the quota.
+
+    This is the endpoint most clients size themselves against, and nothing else. It used
+    to report the host envelope -- 192 cores, 256 GB -- which is a different question and,
+    for any project with a quota, the wrong answer.
+    """
     await _boot(api, flavor="m1.medium")
+
+    # The seeded admin project is unlimited, and -1 is what real Nova reports for that.
     absolute = (await api["nova"].get("/v2.1/limits")).json()["limits"]["absolute"]
-    assert absolute["maxTotalCores"] == 192
-    assert absolute["totalCoresUsed"] == 2
-    assert absolute["maxTotalRAMSize"] == 261632
-    assert absolute["totalRAMUsed"] == 4352
+    assert absolute["maxTotalInstances"] == -1
+    assert absolute["maxTotalCores"] == -1 and absolute["maxTotalRAMSize"] == -1
+
+    # Usage is the quota's, which charges the flavor -- not capacity's, which adds the
+    # 256 MB QEMU overhead per VM on top. 4096 here, 4352 if this ever reads capacity.
     assert absolute["totalInstancesUsed"] == 1
+    assert absolute["totalCoresUsed"] == 2
+    assert absolute["totalRAMUsed"] == 4096
+
+    # Set a quota and the ceilings follow it, which is the whole point.
+    await api["nova"].put(
+        f"/v2.1/os-quota-sets/{cloud.project_id}",
+        json={"quota_set": {"instances": 4, "cores": 8, "ram": 16384}},
+    )
+    absolute = (await api["nova"].get("/v2.1/limits")).json()["limits"]["absolute"]
+    assert absolute["maxTotalInstances"] == 4
+    assert absolute["maxTotalCores"] == 8
+    assert absolute["maxTotalRAMSize"] == 16384
+    assert absolute["totalCoresUsed"] == 2  # unchanged; the boot above still counts
+
+
+async def test_limits_network_fields_come_from_neutrons_quota(api, cloud) -> None:
+    """Nova proxied these from Neutron until 2.36, so they have to be read from it.
+
+    They were hardcoded literals copied from the defaults, which agreed with Neutron
+    until the day someone edited `NEUTRON_DEFAULTS` and then silently did not.
+    """
+    await api["neutron"].put(
+        f"/v2.0/quotas/{cloud.project_id}", json={"quota": {"floatingip": 7}}
+    )
+    headers = {"OpenStack-API-Version": "compute 2.35"}
+    absolute = (await api["nova"].get(
+        "/v2.1/limits", headers=headers)).json()["limits"]["absolute"]
+    assert absolute["maxTotalFloatingIps"] == 7
+
+    # 2.36 removed them; reporting them past that is how code reads a key real Nova
+    # will not send.
+    headers = {"OpenStack-API-Version": "compute 2.36"}
+    absolute = (await api["nova"].get(
+        "/v2.1/limits", headers=headers)).json()["limits"]["absolute"]
+    assert "maxTotalFloatingIps" not in absolute
+    assert "maxSecurityGroups" not in absolute
 
 
 async def test_availability_zones_and_services(api) -> None:

@@ -1485,33 +1485,74 @@ async def get_hypervisor(
     return {"hypervisor": await _hypervisor_dict(session, detail=True)}
 
 
+def _legacy_limits(
+    request: Request,
+    network_limits: dict[str, int],
+    network_usage: dict[str, int],
+    metadata_items: int,
+) -> dict[str, int]:
+    """Absolute limits Nova used to report and no longer does, for clients pinned before.
+
+    The network three were proxied from Neutron until 2.36, so they are read from
+    Neutron's quota rather than restated here -- a hardcoded copy drifts silently the
+    first time someone edits ``NEUTRON_DEFAULTS``. 2.39 dropped ``maxImageMeta``, and
+    2.57 dropped the personality-file limits with the feature itself.
+    """
+    legacy: dict[str, int] = {}
+    if not at_least(request, "2.36"):
+        legacy |= {
+            "maxSecurityGroups": network_limits["security_group"],
+            "maxSecurityGroupRules": network_limits["security_group_rule"],
+            "maxTotalFloatingIps": network_limits["floatingip"],
+            "totalSecurityGroupsUsed": network_usage.get("security_group", 0),
+            "totalFloatingIpsUsed": network_usage.get("floatingip", 0),
+        }
+    if not at_least(request, "2.39"):
+        legacy["maxImageMeta"] = metadata_items
+    if not at_least(request, "2.57"):
+        legacy |= {"maxPersonality": 5, "maxPersonalitySize": 10240}
+    return legacy
+
+
 @router.get("/v2.1/limits")
 async def limits(
-    auth: AuthContext = auth_dep, session: AsyncSession = Depends(get_session)
+    request: Request,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    usage = await get_usage(session)
+    """This project's quota, and its usage against it -- not the node's capacity.
+
+    Real Nova builds every one of these from the effective quota, and a client that
+    reads ``/limits`` and nothing else is doing the ordinary thing: it is the endpoint
+    that answers "how many more may I boot?". Reporting the host envelope here told
+    every such client the project could boot until the hardware ran out, which is a
+    different question and, for any project with a quota, the wrong answer.
+
+    Capacity is still the second ceiling and still binds -- ``os-hypervisors``, the
+    dashboard and Placement report it, as they do in a real cloud.
+    """
+    limit = await quotas.limits(session, SERVICE, auth.project_id)
+    used = await quotas.usage(session, SERVICE, auth.project_id)
+    network_limits = await quotas.limits(session, "neutron", auth.project_id)
+    network_usage = await quotas.usage(session, "neutron", auth.project_id)
     return {
         "limits": {
             "rate": [],
             "absolute": {
-                "maxTotalCores": int(usage.vcpus_allocatable),
-                "totalCoresUsed": usage.vcpus_used,
-                "maxTotalRAMSize": int(usage.ram_allocatable_mb),
-                "totalRAMUsed": usage.ram_used_mb,
-                "maxTotalInstances": -1,
-                "totalInstancesUsed": usage.total_instances,
-                "maxTotalKeypairs": 100,
-                "maxServerMeta": 128,
-                "maxImageMeta": 128,
-                "maxPersonality": 5,
-                "maxPersonalitySize": 10240,
-                "maxSecurityGroups": 100,
-                "maxSecurityGroupRules": usage.conntrack_max,
-                "maxServerGroups": 10,
-                "maxServerGroupMembers": 10,
-                "totalFloatingIpsUsed": 0,
-                "maxTotalFloatingIps": 50,
-                "totalSecurityGroupsUsed": 0,
+                "maxTotalCores": limit["cores"],
+                "totalCoresUsed": used.get("cores", 0),
+                "maxTotalRAMSize": limit["ram"],
+                "totalRAMUsed": used.get("ram", 0),
+                "maxTotalInstances": limit["instances"],
+                "totalInstancesUsed": used.get("instances", 0),
+                "maxTotalKeypairs": limit["key_pairs"],
+                "maxServerMeta": limit["metadata_items"],
+                "maxServerGroups": limit["server_groups"],
+                "maxServerGroupMembers": limit["server_group_members"],
+                "totalServerGroupsUsed": used.get("server_groups", 0),
+                **_legacy_limits(
+                    request, network_limits, network_usage, limit["metadata_items"]
+                ),
             },
         }
     }

@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, Request, Response
+from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -607,21 +607,113 @@ async def create_role(
 
 @router.get("/v3/role_assignments")
 async def list_assignments(
-    auth: AuthContext = auth_dep, session: AsyncSession = Depends(get_session)
+    role_id: str | None = Query(None, alias="role.id"),
+    user_id: str | None = Query(None, alias="user.id"),
+    group_id: str | None = Query(None, alias="group.id"),
+    project_id: str | None = Query(None, alias="scope.project.id"),
+    domain_scope: str | None = Query(None, alias="scope.domain.id"),
+    system_scope: str | None = Query(None, alias="scope.system"),
+    inherited_to: str | None = Query(None, alias="scope.OS-INHERIT:inherited_to"),
+    include_names: bool = False,
+    effective: bool = False,
+    auth: AuthContext = auth_dep,
+    session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    rows = (await session.execute(select(RoleAssignment))).scalars().all()
-    return {
-        "role_assignments": [
+    """List role assignments, optionally filtered and with names resolved.
+
+    ``include_names`` is what ``openstack role assignment list --names`` sends. Without
+    it the client reads ``scope.project.name`` off an id-only body and dies with a
+    KeyError, so the names are not cosmetic -- they are the difference between the
+    command working and not.
+    """
+    self_link = {"self": service_url(SERVICE, "/v3/role_assignments")}
+
+    # Only project-scoped, non-inherited assignments exist in the model, so any query
+    # narrowed to a domain, to the system, or to inherited assignments matches nothing.
+    # Answering those with the project list would be a wrong answer rather than a
+    # missing feature.
+    if domain_scope or system_scope or inherited_to:
+        return {"role_assignments": [], "links": self_link}
+
+    stmt = select(RoleAssignment)
+    if role_id:
+        stmt = stmt.where(RoleAssignment.role_id == role_id)
+    if project_id:
+        stmt = stmt.where(RoleAssignment.project_id == project_id)
+    if group_id:
+        stmt = stmt.where(RoleAssignment.group_id == group_id)
+    rows = (await session.execute(stmt)).scalars().all()
+
+    # `effective` means "the roles this actor really has", so a group assignment becomes
+    # one assignment per member and the group row itself drops out. The expansion has to
+    # happen before the user filter, or a role held only through a group would not match
+    # --user.
+    if effective:
+        memberships = (await session.execute(select(GroupMembership))).scalars().all()
+        members: dict[str, list[str]] = {}
+        for membership in memberships:
+            members.setdefault(membership.group_id, []).append(membership.user_id)
+        pairs: list[tuple[RoleAssignment, str | None]] = []
+        for row in rows:
+            if row.group_id:
+                pairs.extend((row, member) for member in members.get(row.group_id, []))
+            else:
+                pairs.append((row, row.user_id))
+    else:
+        pairs = [(row, row.user_id) for row in rows]
+
+    if user_id:
+        pairs = [(row, actor) for row, actor in pairs if actor == user_id]
+
+    role_names: dict[str, str] = {}
+    user_names: dict[str, str] = {}
+    project_names: dict[str, str] = {}
+    group_names: dict[str, str] = {}
+    if include_names:
+        role_names = {r.id: r.name for r in (await session.execute(select(Role))).scalars()}
+        user_names = {u.id: u.name for u in (await session.execute(select(User))).scalars()}
+        project_names = {
+            p.id: p.name for p in (await session.execute(select(Project))).scalars()
+        }
+        group_names = {g.id: g.name for g in (await session.execute(select(Group))).scalars()}
+
+    assignments: list[dict[str, Any]] = []
+    for row, actor in pairs:
+        # An expanded group assignment is reported as the member's own assignment.
+        as_group = bool(row.group_id) and not effective
+
+        role_block: dict[str, Any] = {"id": row.role_id}
+        project_block: dict[str, Any] = {"id": row.project_id}
+        actor_block: dict[str, Any] = {"id": row.group_id if as_group else actor}
+        if include_names:
+            role_block["name"] = role_names.get(row.role_id, "")
+            project_block["name"] = project_names.get(row.project_id, "")
+            project_block["domain"] = DOMAIN
+            actor_block["name"] = (
+                group_names.get(row.group_id, "")
+                if as_group
+                else user_names.get(actor or "", "")
+            )
+            actor_block["domain"] = DOMAIN
+
+        actor_kind = "groups" if as_group else "users"
+        actor_id = row.group_id if as_group else actor
+        assignments.append(
             {
-                "role": {"id": row.role_id},
-                "scope": {"project": {"id": row.project_id}},
-                "user": {"id": row.user_id},
-                "links": {"assignment": ""},
+                "role": role_block,
+                "scope": {"project": project_block},
+                "group" if as_group else "user": actor_block,
+                "links": {
+                    "assignment": service_url(
+                        SERVICE,
+                        f"/v3/projects/{row.project_id}/{actor_kind}"
+                        f"/{actor_id}/roles/{row.role_id}",
+                    )
+                },
             }
-            for row in rows
-        ],
-        "links": {"self": service_url(SERVICE, "/v3/role_assignments")},
-    }
+        )
+
+    return {"role_assignments": assignments, "links": self_link}
 
 
 @router.put("/v3/projects/{project_id}/users/{user_id}/roles/{role_id}", status_code=204)

@@ -51,9 +51,12 @@ async def test_seeded_admin_is_unlimited(api: dict[str, Any], cloud: Any) -> Non
     assert body["instances"] == -1 and body["cores"] == -1
 
 
-async def test_an_untouched_project_gets_upstream_defaults(api: dict[str, Any], cloud: Any) -> None:
+async def test_an_untouched_project_gets_the_service_defaults(
+    api: dict[str, Any], cloud: Any
+) -> None:
+    """Sized for ten VMs, so a project provisioned after this one inherits room to boot."""
     body = (await api["nova"].get("/v2.1/os-quota-sets/brand-new")).json()["quota_set"]
-    assert body["instances"] == 10 and body["cores"] == 20 and body["ram"] == 51200
+    assert body["instances"] == 10 and body["cores"] == 20 and body["ram"] == 81920
 
 
 async def test_defaults_endpoint_ignores_overrides(api: dict[str, Any], cloud: Any) -> None:
@@ -62,6 +65,23 @@ async def test_defaults_endpoint_ignores_overrides(api: dict[str, Any], cloud: A
     defaults = (await api["nova"].get(
         f"/v2.1/os-quota-sets/{cloud.project_id}/defaults")).json()["quota_set"]
     assert defaults["cores"] == 20
+
+
+async def test_storage_and_network_defaults_cover_the_same_ten_vms(
+    api: dict[str, Any], cloud: Any
+) -> None:
+    """Nova's limits are only a third of a bootable VM; the other two services have to agree.
+
+    Ten VMs booted from volume take a root and a data volume each, one port and one
+    floating IP -- so a `cores` ceiling that fits ten is a lie if `volumes` fits five.
+    """
+    storage = (await api["cinder"].get(
+        f"/v3/os-quota-sets/{cloud.project_id}/defaults")).json()["quota_set"]
+    assert storage["volumes"] == 25 and storage["gigabytes"] == 2000
+
+    network = (await api["neutron"].get(
+        f"/v2.0/quotas/{cloud.project_id}/default")).json()["quota"]
+    assert network["port"] == 60 and network["floatingip"] == 15
 
 
 async def test_detail_endpoint_reports_usage(api: dict[str, Any], cloud: Any) -> None:

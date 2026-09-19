@@ -260,16 +260,34 @@ async def test_snapshot_of_an_attached_volume_needs_force(api) -> None:
 
 
 async def test_limits_quotas_and_pools(api, cloud) -> None:
+    """`/v3/limits` is the project's quota; `get_pools` is the node. Both, separately."""
     await _volume(api, size=100)
     absolute = (await api["cinder"].get("/v3/limits")).json()["limits"]["absolute"]
-    assert absolute["maxTotalVolumeGigabytes"] == 4096
-    assert absolute["totalGigabytesUsed"] == 100
 
-    # The absolute limits above are the node's; the quota is the project's, and the
-    # seeded admin project has none -- so storage capacity is what binds for it.
+    # The seeded admin project is unlimited, so the ceilings read -1 rather than the
+    # node's 4096 GB -- which is shared by every project and answers a different question.
+    assert absolute["maxTotalVolumeGigabytes"] == -1
+    assert absolute["maxTotalVolumes"] == -1
+
+    # These three were hardcoded zeros; no amount of provisioning moved them.
+    assert absolute["totalGigabytesUsed"] == 100
+    assert absolute["totalVolumesUsed"] == 1
+    assert absolute["totalSnapshotsUsed"] == 0
+
     quota = (await api["cinder"].get(f"/v3/os-quota-sets/{cloud.project_id}")).json()["quota_set"]
     assert quota["id"] == cloud.project_id and quota["gigabytes"] == -1
 
+    # Set one, and the limits endpoint follows it.
+    await api["cinder"].put(
+        f"/v3/os-quota-sets/{cloud.project_id}",
+        json={"quota_set": {"volumes": 5, "gigabytes": 500}},
+    )
+    absolute = (await api["cinder"].get("/v3/limits")).json()["limits"]["absolute"]
+    assert absolute["maxTotalVolumes"] == 5
+    assert absolute["maxTotalVolumeGigabytes"] == 500
+    assert absolute["totalGigabytesUsed"] == 100
+
+    # The node's capacity is still reported, here -- unchanged by any of the above.
     pools = (await api["cinder"].get("/v3/scheduler-stats/get_pools")).json()["pools"]
     assert pools[0]["capabilities"]["allocated_capacity_gb"] == 100
     assert pools[0]["capabilities"]["total_capacity_gb"] == 4096

@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import pytest
 
+from app.core.database import SessionLocal
+from app.models.identity import RoleAssignment
+
 pytestmark = pytest.mark.anyio
 
 PASSWORD_AUTH = {
@@ -184,6 +187,85 @@ async def test_roles_and_assignments(api, cloud) -> None:
     assignments = (await client.get("/v3/role_assignments")).json()["role_assignments"]
     assert len(assignments) == 3
     assert all(a["scope"]["project"]["id"] == cloud.project_id for a in assignments)
+
+
+async def test_role_assignment_filters(api, cloud) -> None:
+    """The CLI sends these as dotted query params; ignoring them returns another
+    project's rows, which reads as a real answer rather than as a missing filter."""
+    client = api["keystone"]
+    roles = {r["name"]: r["id"] for r in (await client.get("/v3/roles")).json()["roles"]}
+    empty = await client.post("/v3/projects", json={"project": {"name": "empty-proj"}})
+    empty_id = empty.json()["project"]["id"]
+
+    async def listed(**params: str) -> list[dict]:
+        response = await client.get("/v3/role_assignments", params=params)
+        assert response.status_code == 200
+        return response.json()["role_assignments"]
+
+    assert await listed(**{"scope.project.id": empty_id}) == []
+    assert await listed(**{"user.id": "no-such-user"}) == []
+    assert len(await listed(**{
+        "scope.project.id": cloud.project_id, "user.id": cloud.user_id})) == 3
+    assert [r["role"]["id"] for r in await listed(**{"role.id": roles["reader"]})] == [
+        roles["reader"]
+    ]
+
+    # Assignments are only ever project-scoped here, so a domain- or system-scoped
+    # query matches nothing rather than falling back to the project list.
+    assert await listed(**{"scope.domain.id": "default"}) == []
+    assert await listed(**{"scope.system": "all"}) == []
+
+
+async def test_role_assignment_include_names(api, cloud) -> None:
+    """``--names`` reads scope.project.name straight off the body: an id-only
+    response makes the client raise KeyError instead of printing a table."""
+    client = api["keystone"]
+    user_name = (await client.get(f"/v3/users/{cloud.user_id}")).json()["user"]["name"]
+
+    response = await client.get("/v3/role_assignments", params={
+        "scope.project.id": cloud.project_id, "include_names": "True"})
+    rows = response.json()["role_assignments"]
+    assert len(rows) == 3
+    for row in rows:
+        assert row["role"]["name"]
+        assert row["scope"]["project"]["name"] == cloud.project_name
+        assert row["scope"]["project"]["domain"]["name"] == "Default"
+        assert row["user"]["name"] == user_name
+        assert row["user"]["domain"]["name"] == "Default"
+
+    # Omitting it keeps the id-only shape the rest of the suite expects.
+    plain = (await client.get("/v3/role_assignments")).json()["role_assignments"]
+    assert all("name" not in r["scope"]["project"] for r in plain)
+
+
+async def test_effective_expands_group_assignments(api, cloud) -> None:
+    """A role held through a group only shows up against the user under ``effective``."""
+    client = api["keystone"]
+    auditor = (await client.post(
+        "/v3/roles", json={"role": {"name": "auditor"}})).json()["role"]["id"]
+    group = (await client.post(
+        "/v3/groups", json={"group": {"name": "ops"}})).json()["group"]
+    assert (await client.put(
+        f"/v3/groups/{group['id']}/users/{cloud.user_id}")).status_code == 204
+
+    async with SessionLocal() as session:
+        session.add(RoleAssignment(
+            group_id=group["id"], project_id=cloud.project_id, role_id=auditor))
+        await session.commit()
+
+    direct = (await client.get("/v3/role_assignments", params={
+        "user.id": cloud.user_id})).json()["role_assignments"]
+    assert auditor not in [r["role"]["id"] for r in direct]
+
+    effective = (await client.get("/v3/role_assignments", params={
+        "user.id": cloud.user_id, "effective": "True"})).json()["role_assignments"]
+    assert auditor in [r["role"]["id"] for r in effective]
+
+    # Unexpanded, the assignment belongs to the group rather than to any user.
+    grouped = (await client.get("/v3/role_assignments", params={
+        "group.id": group["id"]})).json()["role_assignments"]
+    assert [r["group"]["id"] for r in grouped] == [group["id"]]
+    assert "user" not in grouped[0]
 
 
 async def test_domains_and_regions(api) -> None:

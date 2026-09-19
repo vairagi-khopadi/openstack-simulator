@@ -13,6 +13,7 @@ blocked on a decision rather than on time.
 | 2 | Per-project quotas, enforced | **complete** |
 | 3 | Missing resource families (six of them) | **complete** |
 | 4 | The long tail | **~8 of 15 areas** |
+| 5 | Configuration: the real `nova.conf` / `cinder.conf` / `neutron.conf` | planned |
 
 Phases 1–3 landed in `467e0b4..1e3aab1`. Phase 4 is in progress.
 
@@ -108,6 +109,74 @@ implemented yet:
 
 Each becomes a one-line entry in `_COUNTERS` (`app/services/quotas.py`) as soon as the
 resource behind it exists.
+
+---
+
+## Phase 5 — configuration files
+
+**Decided:** the simulator will read the same configuration files as real OpenStack —
+`nova.conf`, `cinder.conf`, `neutron.conf` — in the same INI format, under the same
+section and option names. Not a simulator-specific format that happens to hold the same
+numbers.
+
+**Why:** quota defaults are the case that forced it. They live in three Python dicts in
+`app/services/quotas.py` and nothing but an editor changes them; the only environment
+variable in the area is `OPENSTACK_SIMULATOR_ENFORCE_QUOTAS`, which is all-or-nothing.
+Anyone arriving from a real deployment reaches for `[quota] instances` in `nova.conf`,
+finds no such file, and has to be told the defaults are compiled in. Reading the real
+files means a runbook written against OpenStack transfers unchanged, which is the point
+of the simulator.
+
+### The option names are not symmetric
+
+The three services spell their quota options three different ways, and the mapping layer
+has to carry that rather than inventing a uniform one:
+
+| File | Section | Spelling | Example |
+| --- | --- | --- | --- |
+| `nova.conf` | `[quota]` | bare resource name | `instances = 10` |
+| `cinder.conf` | `[DEFAULT]` | `quota_`-prefixed | `quota_volumes = 25` |
+| `neutron.conf` | `[quotas]` | `quota_`-prefixed | `quota_floatingip = 15` |
+
+Two names also do not translate one-for-one: Cinder's `per_volume_gigabytes` is
+`per_volume_size_limit` in the file, and Neutron's `default_quota` is a catch-all with no
+counterpart in `NEUTRON_DEFAULTS`. Both need a decision at implementation time rather than
+a mechanical rename.
+
+### Scope
+
+Quotas first, because that is the concrete complaint. The same loader then has obvious
+second users — `[DEFAULT] cpu_allocation_ratio` and `ram_allocation_ratio` in
+`nova.conf` are already settings here under `OPENSTACK_SIMULATOR_*` names — so the
+loader should be general from the start even if only `[quota]` is wired up in the first
+pass.
+
+### Precedence
+
+Four layers, lowest first. This matches real OpenStack for the bottom two and keeps the
+existing environment variables working, which is what the tests and `openrc.sh` use:
+
+1. the dicts in `app/services/quotas.py` — the compiled-in default, unchanged
+2. the conf file, when one is found
+3. `OPENSTACK_SIMULATOR_*` environment variables
+4. the per-project override in the `quotas` table — always wins, as it does today
+
+Putting the environment above the file is the one departure from oslo.config, and it is
+deliberate: a test that exports a variable should not be silently overridden by a file
+left in the working directory.
+
+### Open at implementation time
+
+- **How the files are found.** Real OpenStack takes `--config-file` and falls back to
+  `/etc/nova/nova.conf`. Reading `/etc` from a simulator that runs unprivileged in a
+  working directory is wrong, so this most likely becomes a `--config-dir` flag defaulting
+  to `./etc/`, with `--config-file` accepted per service.
+- **Reload.** The dicts are module constants read at import, so a file change needs a
+  restart. Live reload is a separate question and should not block the first pass.
+- **Whether `openstack quota show --default` should reflect the file.** It reads
+  `NOVA_DEFAULTS` directly (`app/api/nova.py:1643`, and the two siblings in Cinder and
+  Neutron). If the loader mutates those dicts at startup the endpoints follow for free; if
+  it layers on top, all three need rewiring.
 
 ---
 
@@ -210,9 +279,9 @@ Recorded so they are not re-opened by accident.
   node by design; a second provider that nothing could schedule to would be fiction rather
   than a gap. Traits, aggregates and custom resource classes — the things an operator
   actually sets on a single-provider cloud — are implemented.
-- **The seeded `admin` project gets unlimited quotas.** Upstream's defaults (10 instances,
-  20 cores, 50 GB RAM) would bind long before a 256 GB node does, so a default install
-  would never reach the depletion model the simulator exists to demonstrate. A project
-  created afterwards gets the real defaults.
+- **The seeded `admin` project gets unlimited quotas.** Even the service defaults (10
+  instances, 20 cores, 80 GB RAM) would bind long before a 256 GB node does, so a default
+  install would never reach the depletion model the simulator exists to demonstrate. A
+  project created afterwards gets the real defaults.
 - **An unversioned request is served at the service minimum**, not the maximum, matching a
   real deployment — which is what makes a missing microversion pin visible.

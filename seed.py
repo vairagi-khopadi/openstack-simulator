@@ -469,9 +469,9 @@ async def seed_quotas(session: AsyncSession, project_id: str) -> None:
     """Give the bootstrap admin project unlimited quotas.
 
     Quotas and capacity are two different ceilings, and this seeder decides which one the
-    shipped cloud demonstrates. Upstream's defaults (10 instances, 20 cores, 50 GB RAM)
-    would bind long before the node's 256 GB does, so the depletion model -- the thing
-    this simulator exists to show -- would never be reached on a default install.
+    shipped cloud demonstrates. Even the service defaults (10 instances, 20 cores, 80 GB
+    RAM) would bind long before the node's 256 GB does, so the depletion model -- the
+    thing this simulator exists to show -- would never be reached on a default install.
 
     Unlimited here is also what an operator actually does with the admin project. A
     project created afterwards gets the real defaults, so quota enforcement is one

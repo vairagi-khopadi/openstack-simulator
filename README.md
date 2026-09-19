@@ -376,11 +376,18 @@ Nova, Cinder and Neutron each own the quotas for their own resources, so one
 `openstack quota set` fans out to three services. Going over reports in each service's own
 dialect: Nova `403`, Cinder `413 VolumeLimitExceeded`, Neutron `409 OverQuota`.
 
-A project with nothing set gets upstream's defaults (10 instances, 20 cores, 50 GB RAM,
-10 volumes, 100 networks). **The seeded `admin` project is deliberately unlimited**, so a
-default install still demonstrates the depletion model below rather than stopping at 10
-instances — set a quota on it to see enforcement. `OPENSTACK_SIMULATOR_ENFORCE_QUOTAS=0`
-leaves the quota APIs readable and writable but binding on nothing.
+A project with nothing set gets the service defaults in `app/services/quotas.py` — sized
+for ten VMs with a data volume each (10 instances, 20 cores, 80 GB RAM, 25 volumes,
+2000 GB, 15 floating IPs), not copied from upstream. There are no per-resource env vars
+yet: edit those three dicts and restart. *Planned:* reading the real `nova.conf`,
+`cinder.conf` and `neutron.conf`, with the same sections and option names a deployment
+uses, so `[quota] instances = 10` works here as it does there — see
+[docs/roadmap.md](docs/roadmap.md), phase 5.
+
+**The seeded `admin` project is deliberately unlimited**, so a default install still
+demonstrates the depletion model below rather than stopping at 10 instances — set a quota
+on it to see enforcement. `OPENSTACK_SIMULATOR_ENFORCE_QUOTAS=0` leaves the quota APIs
+readable and writable but binding on nothing.
 
 ## Depletion model
 
@@ -402,8 +409,14 @@ State affects the booking, exactly as on real hardware:
 | `SHELVED_OFFLOADED` | released | released | **held** |
 | deleted | released | released | released |
 
-Nova, Placement, `/v2.1/limits` and the dashboard all read the same aggregation, so they
-cannot disagree.
+`os-hypervisors`, Placement, `scheduler-stats/get_pools` and the dashboard all read the
+same aggregation, so they cannot disagree about the node.
+
+`/v2.1/limits` and `/v3/limits` are **not** in that list. They report the project's quota
+and its usage, as real Nova and Cinder do — the endpoint answers "how many more may I
+boot?", which is a question about policy, not hardware. A project with an unlimited quota
+sees `-1` there while the node is half full; that is the correct answer to the question
+asked, and capacity still refuses the boot when it binds.
 
 ## Failure injection
 

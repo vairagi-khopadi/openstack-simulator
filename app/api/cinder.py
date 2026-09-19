@@ -833,21 +833,30 @@ async def delete_snapshot(
 async def limits(
     auth: AuthContext = auth_dep, session: AsyncSession = Depends(get_session)
 ) -> dict[str, Any]:
-    usage = await get_usage(session)
+    """This project's block-storage quota and its usage -- not the node's disk.
+
+    Same correction as Nova's ``/v2.1/limits``: real Cinder derives every field from the
+    effective quota, so a client sizing its next volume against this endpoint was being
+    told about 4 TB of host disk shared by every project rather than its own ceiling.
+    The three ``used`` counters were hardcoded zeros, which no amount of provisioning
+    moved. Node capacity is still reported, by ``scheduler-stats/get_pools``.
+    """
+    limit = await quotas.limits(session, SERVICE, auth.project_id)
+    used = await quotas.usage(session, SERVICE, auth.project_id)
     return {
         "limits": {
             "rate": [],
             "absolute": {
-                "totalSnapshotsUsed": 0,
-                "maxTotalBackups": 10,
-                "maxTotalVolumeGigabytes": int(usage.disk_allocatable_gb),
-                "maxTotalSnapshots": 100,
-                "maxTotalBackupGigabytes": 1000,
-                "totalBackupGigabytesUsed": 0,
-                "maxTotalVolumes": 100,
-                "totalVolumesUsed": 0,
-                "totalBackupsUsed": 0,
-                "totalGigabytesUsed": usage.disk_used_volumes_gb,
+                "maxTotalVolumes": limit["volumes"],
+                "totalVolumesUsed": used.get("volumes", 0),
+                "maxTotalSnapshots": limit["snapshots"],
+                "totalSnapshotsUsed": used.get("snapshots", 0),
+                "maxTotalVolumeGigabytes": limit["gigabytes"],
+                "totalGigabytesUsed": used.get("gigabytes", 0),
+                "maxTotalBackups": limit["backups"],
+                "totalBackupsUsed": used.get("backups", 0),
+                "maxTotalBackupGigabytes": limit["backup_gigabytes"],
+                "totalBackupGigabytesUsed": used.get("backup_gigabytes", 0),
             },
         }
     }

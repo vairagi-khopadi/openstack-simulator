@@ -132,6 +132,35 @@ Two numbers move independently:
 
 ### Fixed
 
+- **`GET /v2.1/limits` and `GET /v3/limits` report the project's quota, not the node.**
+  Both derived their `max*` fields from the host envelope — Nova returned
+  `maxTotalCores: 192` and `maxTotalRAMSize: 261632` against a 20-core, 80 GB quota, and
+  a hardcoded `maxTotalInstances: -1` that no `openstack quota set` ever moved; Cinder
+  returned the full 4 TB pool as `maxTotalVolumeGigabytes`. Everything the capacity model
+  could not supply was a frozen literal, including Cinder's `totalVolumesUsed`,
+  `totalSnapshotsUsed` and `totalBackupsUsed`, which were `0` however much was
+  provisioned. Real Nova and Cinder build every one of these from the effective quota,
+  and `/limits` is the endpoint most clients size themselves against and the only one
+  they call — so a client asking "how many more may I boot?" was told the project could
+  boot until the hardware ran out. Both now read the quota tables, and the `total*Used`
+  counters are the requesting project's rather than the node-wide totals (which also
+  means Nova's `totalRAMUsed` no longer includes the 256 MB per-VM QEMU overhead, since
+  quota charges the flavor). Nova's network fields — `maxSecurityGroups`,
+  `maxSecurityGroupRules`, `maxTotalFloatingIps` and their `used` counters — are read
+  from Neutron's quota, as Nova proxied them, and are omitted from 2.36 as Nova omits
+  them; `maxImageMeta` is omitted from 2.39 and the personality limits from 2.57.
+  Node capacity is still reported by `os-hypervisors`, Placement, the dashboard and
+  Cinder's `scheduler-stats/get_pools`.
+- **`GET /v3/role_assignments` honours its query parameters.** It previously took none
+  at all and returned every assignment in the cloud, so `openstack role assignment list
+  --project X --user Y` answered with another project's rows. `role.id`, `user.id`,
+  `group.id` and `scope.project.id` now filter; `include_names=True` (what `--names`
+  sends) resolves role, user, group and project names, without which the client read
+  `scope.project.name` off an id-only body and died with `KeyError: 'name'`; and
+  `effective=True` expands a group assignment into one per member. Assignments are only
+  ever project-scoped here, so `scope.domain.id`, `scope.system` and
+  `scope.OS-INHERIT:inherited_to` match nothing rather than falling back to the project
+  list. The unparameterised response shape is unchanged.
 - `--service` no longer breaks token issuance. Narrowing a run removes entries from
   `PORTS`, but the service catalog still advertised every service and raised
   `KeyError` inside `build_catalog`, so every authenticated request in a narrowed run
@@ -139,6 +168,13 @@ Two numbers move independently:
 
 ### Changed
 
+- **Quota defaults are sized for this cloud, not copied from upstream.** A project with
+  nothing set now gets `ram 81920` (was 51200), `volumes 25` (was 10) and
+  `gigabytes 2000` (was 1000) — ten VMs with a root and a data volume each — while
+  Neutron's `port` drops to 60 (was 500) and `floatingip` to 15 (was 50), which are
+  reductions. The seeded `admin` project is unlimited and unaffected; every other project
+  inherits the new numbers. `openstack quota delete <project>` puts an existing project
+  back on them.
 - Quota endpoints no longer restate the node's capacity. `os-quota-sets` used to return
   `cores: 192` and `ram: 261632` — the host envelope, which moved if you changed
   `OPENSTACK_SIMULATOR_HOST_RAM_MB`. They now return real per-project limits. The seeded
