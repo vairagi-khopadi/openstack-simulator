@@ -435,6 +435,54 @@ async def test_admin_sees_every_project(raw_clients, api) -> None:
     assert "tenant-b-sg" in {g["name"] for g in seen}
 
 
+async def test_a_new_project_gets_its_own_default_group(raw_clients, api) -> None:
+    """Neutron gives every project a `default` group; it appears on first use.
+
+    A project created through the API used to have none, so a client that counts on the
+    pair every real cloud shows -- `default` plus whatever it creates itself -- saw one.
+    """
+    token = await _second_project(raw_clients, api)
+    other = {"X-Auth-Token": token}
+    groups = (await raw_clients["neutron"].get("/v2.0/security-groups",
+                                               headers=other)).json()["security_groups"]
+    assert [g["name"] for g in groups] == ["default"]
+    default = groups[0]
+    assert len(default["security_group_rules"]) == 4, "2 egress + 2 ingress from itself"
+    assert {r["direction"] for r in default["security_group_rules"]} == {"egress", "ingress"}
+
+    again = (await raw_clients["neutron"].get("/v2.0/security-groups",
+                                              headers=other)).json()["security_groups"]
+    assert [g["id"] for g in again] == [default["id"]], "materialised once, not per call"
+
+
+async def test_an_identical_rule_is_a_conflict(api, cloud) -> None:
+    """Neutron answers a duplicate with 409 SecurityGroupRuleExists.
+
+    Clients make rule setup idempotent by creating the rule and reading that 409 as
+    "already there"; accepting the duplicate instead grew a fresh copy of the same rule
+    on every run.
+    """
+    group = (await api["neutron"].post(
+        "/v2.0/security-groups",
+        json={"security_group": {"name": "dupes"}})).json()["security_group"]
+    rule = {"security_group_id": group["id"], "direction": "ingress",
+            "protocol": "icmp", "remote_ip_prefix": "172.26.8.0/23"}
+    first = await api["neutron"].post("/v2.0/security-group-rules",
+                                      json={"security_group_rule": rule})
+    assert first.status_code == 201
+    second = await api["neutron"].post("/v2.0/security-group-rules",
+                                       json={"security_group_rule": rule})
+    assert second.status_code == 409, second.text
+    body = second.json()["NeutronError"]
+    assert body["type"] == "SecurityGroupRuleExists"
+    assert first.json()["security_group_rule"]["id"] in body["message"]
+
+    # Same group, one field different: a rule in its own right, not a duplicate.
+    other = await api["neutron"].post("/v2.0/security-group-rules", json={
+        "security_group_rule": {**rule, "remote_ip_prefix": "10.0.0.0/8"}})
+    assert other.status_code == 201
+
+
 async def test_project_id_filter_narrows_the_listing(api, cloud) -> None:
     seen = (await api["neutron"].get(
         f"/v2.0/security-groups?project_id={cloud.project_id}")).json()["security_groups"]

@@ -18,6 +18,7 @@ from app.core.config import (
     service_url,
     settle_transition,
     transition_deadline,
+    volume_provision_deadline,
 )
 from app.core.database import get_session
 from app.core.pagination import collection_links, page_request, paginate
@@ -384,7 +385,7 @@ async def create_volume(
         source_volid=payload.source_volid,
         metadata_=payload.metadata,
         host="cinder@lvm#LVM_iSCSI",
-        transition_until=transition_deadline(),
+        transition_until=volume_provision_deadline(),
         transition_target="available",
     )
     session.add(volume)

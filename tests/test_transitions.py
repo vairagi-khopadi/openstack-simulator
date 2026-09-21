@@ -7,7 +7,14 @@ from __future__ import annotations
 
 import pytest
 
-from app.core.config import now_utc, settings, transition_deadline, transition_done
+from app.core.config import (
+    Settings,
+    now_utc,
+    settings,
+    transition_deadline,
+    transition_done,
+    volume_provision_deadline,
+)
 from app.models.compute import Server
 from app.models.loadbalancer import LoadBalancer, Listener, Member, Pool
 from app.models.storage import Snapshot, Volume
@@ -145,6 +152,60 @@ async def test_volume_reads_creating_until_the_deadline(api, slow_transitions, e
     assert (await api["cinder"].get(f"/v3/volumes/{volume['id']}")).json()["volume"]["status"] == "creating"
     await expire(Volume, volume["id"])
     assert (await api["cinder"].get(f"/v3/volumes/{volume['id']}")).json()["volume"]["status"] == "available"
+
+
+async def test_a_volume_provisions_on_its_own_short_window() -> None:
+    """The shipped defaults: no wait for a volume, up to a minute for an instance.
+
+    A client that attaches a volume it has just created -- the usual sequence -- depends
+    on Cinder clearing "creating" before its next call lands, and one second is already
+    enough to lose that race against a CLI round trip. Putting a volume back on the
+    instance window is what this guards against.
+    """
+    shipped = Settings()
+    assert shipped.volume_provision_max_seconds == 0, (
+        "a volume must be attachable within a client's next call, not a minute later"
+    )
+    assert shipped.transition_max_seconds >= 10, "instances still build slowly"
+
+    settings.volume_provision_min_seconds = 0
+    settings.volume_provision_max_seconds = 1
+    settings.transition_min_seconds = 60
+    settings.transition_max_seconds = 60
+    try:
+        assert (volume_provision_deadline() - now_utc()).total_seconds() <= 1
+    finally:
+        settings.volume_provision_min_seconds = 0
+        settings.volume_provision_max_seconds = 0
+        settings.transition_min_seconds = 0
+        settings.transition_max_seconds = 0
+
+
+async def test_a_new_volume_attaches_while_instances_still_build(api, expire) -> None:
+    """`volume create` then `server add volume`, the sequence every client writes.
+
+    The instance window stays long here: what makes the attach work is the volume's own
+    window. While the two were shared, Nova refused the attach with "status must be
+    available, currently creating", and a client that rolls a half-finished provision
+    back answers that by deleting the instance it had just booted.
+    """
+    settings.transition_min_seconds = 60
+    settings.transition_max_seconds = 60
+    try:
+        server_id = await _boot(api)
+        await expire(Server, server_id)
+        await api["nova"].get(f"/v2.1/servers/{server_id}")
+
+        volume = (await api["cinder"].post("/v3/volumes",
+                                           json={"volume": {"size": 5}})).json()["volume"]
+        attached = await api["nova"].post(
+            f"/v2.1/servers/{server_id}/os-volume_attachments",
+            json={"volumeAttachment": {"volumeId": volume["id"]}},
+        )
+        assert attached.status_code == 200, attached.text
+    finally:
+        settings.transition_min_seconds = 0
+        settings.transition_max_seconds = 0
 
 
 async def test_a_creating_volume_already_consumes_disk(api, slow_transitions) -> None:

@@ -22,6 +22,7 @@ from app.core.pagination import (
     trim,
 )
 from app.core.middleware import AuthContext, OSPayload, body_object, fault, require
+from app.models.identity import Project
 from app.models.quota import Quota
 from app.models.network import (
     SubPort,
@@ -40,6 +41,7 @@ from app.services.networking import (
     AddressPoolExhausted,
     allocation_pool,
     create_port_record,
+    ensure_default_security_group,
     next_free_ip,
 )
 
@@ -901,6 +903,14 @@ async def list_security_groups(
     auth: AuthContext = auth_dep,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
+    # Neutron materialises a project's "default" group on first use, and a listing is
+    # usually that first use -- it is how a client checks which groups it already has.
+    # Only for a project that exists: a filter naming an unknown one is a question, not
+    # a reason to conjure a group for it.
+    wanted = _requested_project(request) or auth.project_id
+    if await session.get(Project, wanted) is not None:
+        await ensure_default_security_group(session, wanted)
+        await session.commit()
     stmt = scope_to_project(select(SecurityGroup), SecurityGroup, auth, request)
     if "name" in request.query_params:
         stmt = stmt.where(SecurityGroup.name == request.query_params["name"])
@@ -1046,6 +1056,41 @@ async def create_security_group_rule(
             f"Security group {payload.security_group_id} does not exist.",
             type="SecurityGroupNotFound",
         )
+    # An identical rule is a conflict, not a second row. Clients make their rule setup
+    # idempotent by creating the rule and treating this 409 as "already there"; silently
+    # accepting the duplicate instead grows a fresh copy on every run.
+    duplicate = (
+        await session.execute(
+            select(SecurityGroupRule).where(
+                SecurityGroupRule.security_group_id == group.id,
+                SecurityGroupRule.direction == payload.direction,
+                SecurityGroupRule.ethertype == payload.ethertype,
+                SecurityGroupRule.protocol.is_(None)
+                if payload.protocol is None
+                else SecurityGroupRule.protocol == payload.protocol,
+                SecurityGroupRule.port_range_min.is_(None)
+                if payload.port_range_min is None
+                else SecurityGroupRule.port_range_min == payload.port_range_min,
+                SecurityGroupRule.port_range_max.is_(None)
+                if payload.port_range_max is None
+                else SecurityGroupRule.port_range_max == payload.port_range_max,
+                SecurityGroupRule.remote_ip_prefix.is_(None)
+                if payload.remote_ip_prefix is None
+                else SecurityGroupRule.remote_ip_prefix == payload.remote_ip_prefix,
+                SecurityGroupRule.remote_group_id.is_(None)
+                if payload.remote_group_id is None
+                else SecurityGroupRule.remote_group_id == payload.remote_group_id,
+            )
+        )
+    ).scalars().first()
+    if duplicate is not None:
+        raise fault(
+            SERVICE,
+            409,
+            f"Security group rule already exists. Rule id is {duplicate.id}.",
+            type="SecurityGroupRuleExists",
+        )
+
     try:
         await check_conntrack_capacity(session, 1)
     except CapacityError as exc:

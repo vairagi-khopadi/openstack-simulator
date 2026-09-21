@@ -79,18 +79,29 @@ async def fresh_db() -> Any:
     invalidate_scenario_cache()
     settings.transition_min_seconds = 0
     settings.transition_max_seconds = 0
+    settings.volume_provision_min_seconds = 0
+    settings.volume_provision_max_seconds = 0
     yield
     invalidate_scenario_cache()
 
 
 @pytest.fixture
 def slow_transitions() -> Any:
-    """Restore a long window so pending states stay observable during a test."""
+    """Restore a long window so pending states stay observable during a test.
+
+    Volumes provision on their own, much shorter window in production, so that one is
+    stretched here too -- otherwise a volume settles mid-test while everything else is
+    still pending.
+    """
     settings.transition_min_seconds = 60
     settings.transition_max_seconds = 60
+    settings.volume_provision_min_seconds = 60
+    settings.volume_provision_max_seconds = 60
     yield
     settings.transition_min_seconds = 0
     settings.transition_max_seconds = 0
+    settings.volume_provision_min_seconds = 0
+    settings.volume_provision_max_seconds = 0
 
 
 @pytest.fixture

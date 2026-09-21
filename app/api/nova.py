@@ -43,6 +43,7 @@ from app.services.networking import (
     AddressPoolExhausted,
     create_port_record,
     pick_network,
+    resolve_security_groups,
 )
 
 SERVICE = "nova"
@@ -615,6 +616,18 @@ async def create_server(
     except CapacityError as exc:
         raise fault(SERVICE, 403, f"Quota exceeded for {exc.resource}: {exc}")
 
+    # Resolve the requested groups before anything is written: Nova takes a name or a
+    # UUID, rejects a group the project does not have, and reports the *name* back. The
+    # ids are what Neutron then stamps on the instance's ports -- a boot that only
+    # recorded the string it was handed left the ports with no group at all.
+    references = [
+        str(g.get("name") or g.get("id") or "default") for g in payload.security_groups
+    ] or ["default"]
+    try:
+        groups = await resolve_security_groups(session, references, auth.project_id)
+    except KeyError as exc:
+        raise fault(SERVICE, 400, f"Security group {exc.args[0]} not found.")
+
     host = await get_host(session)
     admin_pass = "".join(random.choices(string.ascii_letters + string.digits, k=12))
     server = Server(
@@ -639,9 +652,7 @@ async def create_server(
         metadata_=payload.metadata,
         user_data=payload.user_data,
         config_drive=bool(payload.config_drive),
-        security_group_names=[
-            g.get("name", "default") for g in payload.security_groups
-        ] or ["default"],
+        security_group_names=[g.name for g in groups],
         tags=payload.tags,
         transition_until=transition_deadline(),
         transition_target="ACTIVE",
@@ -650,7 +661,7 @@ async def create_server(
     session.add(server)
     await session.flush()
 
-    await _attach_networks(session, server, payload, auth)
+    await _attach_networks(session, server, payload, auth, [g.id for g in groups])
     await session.commit()
 
     return {
@@ -665,9 +676,19 @@ async def create_server(
 
 
 async def _attach_networks(
-    session: AsyncSession, server: Server, payload: ServerPayload, auth: AuthContext
+    session: AsyncSession,
+    server: Server,
+    payload: ServerPayload,
+    auth: AuthContext,
+    security_group_ids: list[str],
 ) -> None:
-    """Bind ports for the requested networks ("auto", "none" or an explicit list)."""
+    """Bind ports for the requested networks ("auto", "none" or an explicit list).
+
+    Each port the instance gets is stamped with the instance's security groups, which is
+    where they actually take effect -- a port bound without them is an instance whose
+    groups exist on paper only. A port the caller pre-created keeps its own groups, as
+    it does in Nova.
+    """
     requested = payload.networks
     if requested == "none":
         return
@@ -684,6 +705,7 @@ async def _attach_networks(
                     auth.project_id,
                     device_id=server.id,
                     device_owner="compute:nova",
+                    security_group_ids=list(security_group_ids),
                 )
             except AddressPoolExhausted as exc:
                 raise fault(SERVICE, 400, f"Cannot allocate a fixed IP: {exc}")
@@ -708,6 +730,7 @@ async def _attach_networks(
                 auth.project_id,
                 device_id=server.id,
                 device_owner="compute:nova",
+                security_group_ids=list(security_group_ids),
                 fixed_ip=spec.get("fixed_ip"),
             )
         except AddressPoolExhausted as exc:

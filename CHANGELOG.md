@@ -132,6 +132,38 @@ Two numbers move independently:
 
 ### Fixed
 
+- **Every project gets a `default` security group, not just the seeded one.** Neutron
+  materialises a project's `default` group (two egress rules, two ingress rules from the
+  group itself) the first time the project asks for its groups; only the bootstrap admin
+  project had one, so a project created through the API came up with whatever groups its
+  owner created and nothing else. A client that expects the pair every real cloud shows
+  — `default` plus its own — saw one group.
+- **Booting with a security group now applies it.** `POST /v2.1/servers` recorded the
+  `security_groups` strings it was handed without looking them up: an unknown group was
+  accepted silently, a group named by UUID (what a client under an admin identity passes,
+  since a name can match another tenant's group) was echoed back as the group's *name*,
+  and no group ever reached the instance's ports — where a security group is the only
+  place it does anything. Nova takes a name or a UUID, reports the name, refuses a group
+  the project does not have with a `400`, and stamps the ids onto every port it binds for
+  the instance, which is now what happens here. `addSecurityGroup` already did this.
+- **An identical security group rule is a `409`, not a second row.** Neutron answers a
+  duplicate with `SecurityGroupRuleExists` naming the existing rule's id, which is how a
+  client makes its rule setup idempotent — create the rule, treat the conflict as "already
+  there". Accepting the duplicate instead grew a fresh copy of the same rule on every run.
+
+- **A new volume no longer waits out the instance build window before it can be
+  attached.** Every pending resource shared one 10-60s transition window, so a volume
+  read as `creating` for up to a minute after `POST /v3/volumes` — while Nova refuses
+  `os-volume_attachments` until the volume is `available`. The ordinary client sequence,
+  `volume create` followed a second later by `server add volume`, therefore failed with
+  `Invalid volume: ... status must be available, currently creating`, and a client that
+  rolls a half-finished provision back answered that by deleting the instance it had
+  just booted: a VM that went BUILD, ACTIVE, then vanished. Real Cinder clears
+  `creating` before that next call arrives, so volumes now provision on a window of
+  their own — `OPENSTACK_SIMULATOR_VOLUME_PROVISION_MIN`/`_MAX`, zero by default, so a
+  new volume still reads `creating` in the create response and `available` to whatever
+  looks next. Instances still build on the 10-60s window, and raising the volume pair
+  simulates slow storage (even one second loses the race against a CLI round trip).
 - **`GET /v2.1/limits` and `GET /v3/limits` report the project's quota, not the node.**
   Both derived their `max*` fields from the host envelope — Nova returned
   `maxTotalCores: 192` and `maxTotalRAMSize: 261632` against a 20-core, 80 GB quota, and

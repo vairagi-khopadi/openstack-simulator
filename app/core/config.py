@@ -144,6 +144,21 @@ class Settings(BaseModel):
     transition_max_seconds: int = Field(
         default_factory=lambda: _env_int("OPENSTACK_SIMULATOR_TRANSITION_MAX", 60)
     )
+    # A new volume gets a window of its own, and by default no window at all: it reads
+    # "creating" in the create response and "available" to whatever looks next. A volume
+    # is the one resource a client routinely creates and uses in the same breath --
+    # `volume create`, then `server add volume` about a second later -- and Nova refuses
+    # the attach until the volume is available. Real Cinder clears "creating" faster than
+    # that next call arrives, so the sequence works there; on the 10-60s build window it
+    # is a guaranteed 400, and a client that rolls a half-finished provision back answers
+    # that by deleting the instance it just booted. Raise these to simulate slow storage
+    # -- a second is already enough to lose the race against a CLI round trip.
+    volume_provision_min_seconds: int = Field(
+        default_factory=lambda: _env_int("OPENSTACK_SIMULATOR_VOLUME_PROVISION_MIN", 0)
+    )
+    volume_provision_max_seconds: int = Field(
+        default_factory=lambda: _env_int("OPENSTACK_SIMULATOR_VOLUME_PROVISION_MAX", 0)
+    )
 
     # -- identity ---------------------------------------------------------------------
     admin_project: str = Field(default_factory=lambda: _env("OPENSTACK_SIMULATOR_ADMIN_PROJECT", "admin"))
@@ -222,7 +237,7 @@ PORTS: dict[str, int] = {
     "neutron": 9696,
     "placement": 8778,
     "octavia": 9876,
-    "swift": 8080,
+    "swift": 8090,
     "cloudkitty": 8889,
     "scenarios": 8999,
     "dashboard": 10000,
@@ -349,6 +364,17 @@ def transition_deadline(minimum: int | None = None, maximum: int | None = None) 
     low = settings.transition_min_seconds if minimum is None else minimum
     high = settings.transition_max_seconds if maximum is None else maximum
     return now_utc() + timedelta(seconds=random.randint(low, high))
+
+
+def volume_provision_deadline() -> datetime:
+    """The deadline for a new volume's ``creating`` window -- seconds, not the build one.
+
+    See ``volume_provision_min_seconds`` for why a volume does not share the instance
+    window: attaching a volume right after creating it is ordinary client behaviour.
+    """
+    return transition_deadline(
+        settings.volume_provision_min_seconds, settings.volume_provision_max_seconds
+    )
 
 
 def transition_done(deadline: datetime | None) -> bool:

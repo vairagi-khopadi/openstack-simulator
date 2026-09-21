@@ -622,6 +622,48 @@ async def test_security_group_attach_and_detach(api) -> None:
     assert group_id not in ports[0]["security_groups"]
 
 
+async def test_booting_with_a_group_applies_it_to_the_ports(api) -> None:
+    """A group named at boot has to reach the instance's ports to mean anything."""
+    group = (await api["neutron"].post(
+        "/v2.0/security-groups",
+        json={"security_group": {"name": "boot-sg"}})).json()["security_group"]
+    server_id = await _boot(api, name="sg-boot", security_groups=[{"name": "boot-sg"}])
+
+    body = (await api["nova"].get(f"/v2.1/servers/{server_id}")).json()["server"]
+    assert body["security_groups"] == [{"name": "boot-sg"}]
+    ports = (await api["neutron"].get(f"/v2.0/ports?device_id={server_id}")).json()["ports"]
+    assert group["id"] in ports[0]["security_groups"]
+
+
+async def test_booting_with_a_group_uuid_reports_its_name(api) -> None:
+    """Nova takes a name or a UUID and reports the name back.
+
+    A client under an admin identity passes the UUID deliberately -- a name can match
+    another tenant's group -- and then reads the group back by name. Echoing the UUID
+    into the name field instead leaves it unable to recognise its own group.
+    """
+    group = (await api["neutron"].post(
+        "/v2.0/security-groups",
+        json={"security_group": {"name": "by-uuid"}})).json()["security_group"]
+    server_id = await _boot(api, name="sg-uuid",
+                            security_groups=[{"name": group["id"]}])
+
+    body = (await api["nova"].get(f"/v2.1/servers/{server_id}")).json()["server"]
+    assert body["security_groups"] == [{"name": "by-uuid"}]
+    ports = (await api["neutron"].get(f"/v2.0/ports?device_id={server_id}")).json()["ports"]
+    assert group["id"] in ports[0]["security_groups"]
+
+
+async def test_booting_with_an_unknown_group_is_refused(api) -> None:
+    """Better a 400 at boot than an instance whose group silently does not exist."""
+    flavors, images = await _ids(api)
+    response = await api["nova"].post("/v2.1/servers", json={"server": {
+        "name": "sg-ghost", "flavorRef": flavors["m1.small"], "imageRef": images["cirros"],
+        "security_groups": [{"name": "ghost"}]}})
+    assert response.status_code == 400
+    assert "ghost" in response.json()["badRequest"]["message"]
+
+
 async def test_attaching_an_unknown_group_is_a_404(api) -> None:
     server_id = await _boot(api)
     response = await api["nova"].post(f"/v2.1/servers/{server_id}/action",

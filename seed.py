@@ -32,11 +32,11 @@ from app.core.database import SessionLocal, dispose_db, init_db, use_database
 from app.core.schema import SchemaVersionError
 from app.models.compute import Flavor, Hypervisor
 from app.models.identity import Endpoint, Project, Role, RoleAssignment, Service, User
-from app.models.network import Network, SecurityGroup, SecurityGroupRule, Subnet
+from app.models.network import Network, Subnet
 from app.models.quota import UNLIMITED, Quota
 from app.models.storage import Image, VolumeType
 from app.services import quotas as quota_service
-from app.services.networking import allocation_pool
+from app.services.networking import allocation_pool, ensure_default_security_group
 
 FLAVORS: list[dict[str, Any]] = [
     {"id": "1", "name": "m1.tiny", "vcpus": 1, "ram": 512, "disk": 1},
@@ -425,44 +425,12 @@ async def seed_networks(session: AsyncSession, project_id: str) -> None:
 
 
 async def seed_security_group(session: AsyncSession, project_id: str) -> None:
-    """The 'default' group: 2 egress + 2 remote-group ingress rules = 4 conntrack slots."""
-    group = (
-        await session.execute(
-            select(SecurityGroup).where(
-                SecurityGroup.name == "default", SecurityGroup.project_id == project_id
-            )
-        )
-    ).scalar_one_or_none()
-    if group is not None:
-        return
-    group = SecurityGroup(
-        id=deterministic_id(f"secgroup-default-{project_id}"),
-        name="default",
-        description="Default security group",
-        project_id=project_id,
-    )
-    session.add(group)
-    await session.flush()
-    for ethertype in ("IPv4", "IPv6"):
-        session.add(
-            SecurityGroupRule(
-                id=gen_id(),
-                security_group_id=group.id,
-                project_id=project_id,
-                direction="egress",
-                ethertype=ethertype,
-            )
-        )
-        session.add(
-            SecurityGroupRule(
-                id=gen_id(),
-                security_group_id=group.id,
-                project_id=project_id,
-                direction="ingress",
-                ethertype=ethertype,
-                remote_group_id=group.id,
-            )
-        )
+    """The 'default' group: 2 egress + 2 remote-group ingress rules = 4 conntrack slots.
+
+    Same lookup-or-create Neutron runs for any project that asks for its groups, so the
+    seeded cloud and a project created through the API end up with the same thing.
+    """
+    await ensure_default_security_group(session, project_id)
 
 
 async def seed_quotas(session: AsyncSession, project_id: str) -> None:

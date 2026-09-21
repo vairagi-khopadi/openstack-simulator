@@ -12,8 +12,15 @@ import random
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import gen_id
-from app.models.network import FloatingIP, Network, Port, Subnet
+from app.core.config import deterministic_id, gen_id
+from app.models.network import (
+    FloatingIP,
+    Network,
+    Port,
+    SecurityGroup,
+    SecurityGroupRule,
+    Subnet,
+)
 
 
 class AddressPoolExhausted(Exception):
@@ -134,3 +141,90 @@ async def create_port_record(
     )
     session.add(port)
     return port
+
+
+async def ensure_default_security_group(
+    session: AsyncSession, project_id: str
+) -> SecurityGroup:
+    """Return the project's ``default`` group, creating it the first time it is needed.
+
+    Neutron gives every project a ``default`` group with two egress rules and two
+    ingress rules from the group itself; it materialises on first use rather than at
+    project creation, which is why this is a lookup-or-create rather than something the
+    identity API does. Only the bootstrap project used to get one, so a project created
+    through the API had no ``default`` to boot against and a client counting on it saw
+    one group where a real cloud has two.
+    """
+    group = (
+        await session.execute(
+            select(SecurityGroup).where(
+                SecurityGroup.name == "default", SecurityGroup.project_id == project_id
+            )
+        )
+    ).scalars().first()
+    if group is not None:
+        return group
+    group = SecurityGroup(
+        id=deterministic_id(f"secgroup-default-{project_id}"),
+        name="default",
+        description="Default security group",
+        project_id=project_id,
+    )
+    session.add(group)
+    await session.flush()
+    for ethertype in ("IPv4", "IPv6"):
+        session.add(
+            SecurityGroupRule(
+                id=gen_id(),
+                security_group_id=group.id,
+                project_id=project_id,
+                direction="egress",
+                ethertype=ethertype,
+            )
+        )
+        session.add(
+            SecurityGroupRule(
+                id=gen_id(),
+                security_group_id=group.id,
+                project_id=project_id,
+                direction="ingress",
+                ethertype=ethertype,
+                remote_group_id=group.id,
+            )
+        )
+    await session.flush()
+    return group
+
+
+async def resolve_security_groups(
+    session: AsyncSession, references: list[str], project_id: str
+) -> list[SecurityGroup]:
+    """Resolve boot-time security group references -- a name or a UUID, as Nova does.
+
+    Nova accepts either spelling and reports the group by *name* afterwards, so a client
+    that passes UUIDs (the unambiguous choice under an admin identity, where a name can
+    match another tenant's group) still reads its own group's name back. Unknown
+    references raise ``KeyError`` for the caller to turn into the service's own 400.
+    """
+    groups: list[SecurityGroup] = []
+    for reference in references:
+        group = (
+            await session.execute(
+                select(SecurityGroup).where(
+                    SecurityGroup.name == reference,
+                    SecurityGroup.project_id == project_id,
+                )
+            )
+        ).scalars().first()
+        if group is None:
+            candidate = await session.get(SecurityGroup, reference)
+            if candidate is not None and candidate.project_id == project_id:
+                group = candidate
+        if group is None:
+            if reference == "default":
+                group = await ensure_default_security_group(session, project_id)
+            else:
+                raise KeyError(reference)
+        if group.id not in {g.id for g in groups}:
+            groups.append(group)
+    return groups

@@ -500,6 +500,7 @@ Every knob is an `OPENSTACK_SIMULATOR_*` environment variable — see `app/core/
 OPENSTACK_SIMULATOR_CPU_ALLOCATION_RATIO=16.0   # more aggressive overcommit
 OPENSTACK_SIMULATOR_TRANSITION_MIN=1            # fast transitions for CI
 OPENSTACK_SIMULATOR_TRANSITION_MAX=3
+OPENSTACK_SIMULATOR_VOLUME_PROVISION_MAX=30     # slow storage: volumes linger in creating
 OPENSTACK_SIMULATOR_HOST_RAM_MB=8192            # emulate a smaller node
 OPENSTACK_SIMULATOR_REQUIRE_AUTH=0              # skip tokens for curl-driven demos
 OPENSTACK_SIMULATOR_DATABASE=dev.db             # which environment to run (see above)
